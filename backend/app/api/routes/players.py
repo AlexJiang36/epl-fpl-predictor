@@ -1,10 +1,12 @@
 from typing import Optional
+
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from app.core.db import get_db
 from app.models.player import Player
+
 
 router = APIRouter(prefix="/players", tags=["players"])
 
@@ -13,6 +15,8 @@ def list_players(
     position: Optional[str] = None,
     team_id: Optional[int] = None,
     search: Optional[str] = Query(default=None, min_length=1),
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ):
     """
@@ -32,9 +36,14 @@ def list_players(
     if search is not None:
         stmt = stmt.where(Player.web_name.ilike(f"%{search}%"))
 
+    total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
+
+    stmt = stmt.order_by(Player.id).offset(offset).limit(limit)
+
     players = db.execute(stmt).scalars().all()
 
     return {
+        "meta": {"total": total, "limit": limit, "offset": offset},
         "players": [
             {
                 "id": p.id,
