@@ -2,7 +2,7 @@ from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import select
+from sqlalchemy import select, func
 
 from app.core.db import get_db
 from app.models.fixture import Fixture
@@ -25,12 +25,17 @@ def list_fixtures(
     if finished is not None:
         stmt = stmt.where(Fixture.finished == finished)
 
+    total = db.execute(
+        select(func.count()).select_from(stmt.subquery())
+    ).scalar_one()
+
+
     fixtures = db.execute(
         stmt.order_by(Fixture.id).offset(offset).limit(limit)
     ).scalars().all()
 
     return {
-        "meta": {"limit": limit, "offset": offset},
+        "meta": {"total": total, "limit": limit, "offset": offset},
         "fixtures": [
             {
                 "id": f.id,
