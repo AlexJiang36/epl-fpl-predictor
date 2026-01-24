@@ -8,6 +8,8 @@ from app.api.routes.fixtures import router as fixtures_router
 from app.api.routes.gameweeks import router as gameweeks_router
 from app.api.routes.player_gw_stats import router as player_gw_stats_router
 from app.api.routes.ingest_gw_stats import router as ingest_gw_stats_router
+from app.api.routes.predictions import router as predictions_router
+
 
 
 app = FastAPI(title="EPL/FPL Predictor")
@@ -21,3 +23,5 @@ app.include_router(fixtures_router)
 app.include_router(gameweeks_router)
 app.include_router(player_gw_stats_router)
 app.include_router(ingest_gw_stats_router)
+app.include_router(predictions_router)
+
