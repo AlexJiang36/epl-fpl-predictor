@@ -116,7 +116,8 @@ def run_baseline(
     finished_gws = (
         db.execute(
             select(Gameweek.gw)
-            .where(Gameweek.is_finished == True)
+            .where(Gameweek.is_finished == True,
+                   Gameweek.gw < target_gw)
             .order_by(Gameweek.gw.desc())
             .limit(window)
         )
