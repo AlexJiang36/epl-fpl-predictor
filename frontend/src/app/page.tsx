@@ -128,7 +128,7 @@ export default function Page() {
         <header className="flex flex-col gap-2">
           <h1 className="text-3xl font-bold">FPL Squad Recommendation</h1>
           <p className="text-slate-600">
-            Minimal Day14 UI: calls <code className="px-1 py-0.5 bg-slate-100 rounded">/recommendations/squad</code>{" "}
+            Minimal Day14 UI: calls <code className="px-1 py-0.5 bg-slate-100 rounded">/api/squad</code>{" "}
             and displays a compact squad.
           </p>
         </header>
