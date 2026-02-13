@@ -8,27 +8,7 @@ type SortDir = "desc" | "asc";
 type Position = "GKP" | "DEF" | "MID" | "FWD" | "";
 type Status = "" | "a" | "i" | "u" | "s";
 
-/**
- * Teams dropdown (team_id).
- * You confirmed: Arsenal = 3.
- *
- * If any IDs differ in your DB, adjust here later (Day18+).
- * UI shows only team name (and optionally short name), not team_id.
- */
-const TEAMS: Array<{ id: number; short: string; name: string }> = [
-  { id: 3, short: "ARS", name: "Arsenal" }, // confirmed
-  { id: 9, short: "CHE", name: "Chelsea" }, // seen in your sample
-  { id: 14, short: "LIV", name: "Liverpool" }, // seen in your sample
-  { id: 21, short: "WHU", name: "West Ham" }, // seen previously
-  { id: 22, short: "WOL", name: "Wolves" }, // seen previously
-  { id: 7, short: "BRE", name: "Brentford" }, // seen previously
-  { id: 8, short: "BHA", name: "Brighton" }, // seen previously
-  { id: 6, short: "BOU", name: "Bournemouth" },
-  { id: 13, short: "LEE", name: "Leeds" }, // from your squad output (LEE)
-  { id: 19, short: "SUN", name: "Sunderland" }, // from your squad output (SUN)
-  { id: 4, short: "AVL", name: "Aston Villa" }, // seen in your sample
-  // Add more teams as you confirm IDs from your backend responses.
-];
+type TeamOpt = { id: number; name: string; short_name: string; fpl_team_id?: number };
 
 function num(v: any): number | null {
   const n = Number(v);
@@ -96,6 +76,52 @@ export default function PredictionsPage() {
   // Whether user has ever fetched at least once (to enable auto refresh on paging)
   const [hasFetched, setHasFetched] = useState(false);
 
+  // -----------------------
+  // Day18: teams dropdown from backend
+  // -----------------------
+  const [teams, setTeams] = useState<TeamOpt[]>([]);
+  const [teamsLoading, setTeamsLoading] = useState(false);
+  const [teamsErr, setTeamsErr] = useState<string | null>(null);
+
+  async function loadTeams() {
+    setTeamsLoading(true);
+    setTeamsErr(null);
+    try {
+      const res = await fetch("/api/teams", { cache: "no-store" });
+      const body = await res.json();
+
+      if (!res.ok) {
+        const msg = body?.error?.message || body?.message || `Request failed (${res.status})`;
+        throw new Error(msg);
+      }
+
+      // backend shape: { teams: [{id,fpl_team_id,name,short_name}, ...] }
+      const listRaw = Array.isArray(body?.teams) ? body.teams : [];
+      const list: TeamOpt[] = listRaw
+        .map((t: any) => ({
+          id: Number(t.id),
+          name: String(t.name ?? ""),
+          short_name: String(t.short_name ?? ""),
+          fpl_team_id: t.fpl_team_id !== undefined ? Number(t.fpl_team_id) : undefined,
+        }))
+        .filter((t: TeamOpt) => Number.isFinite(t.id) && t.name.length > 0);
+
+      list.sort((a, b) => a.name.localeCompare(b.name));
+      setTeams(list);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : "Unknown error";
+      setTeamsErr(msg);
+      setTeams([]);
+    } finally {
+      setTeamsLoading(false);
+    }
+  }
+
+  useEffect(() => {
+    loadTeams();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
   const canFetchDraft =
     Number.isFinite(targetGw) && targetGw > 0 && Number.isFinite(limit) && limit > 0;
 
@@ -105,7 +131,7 @@ export default function PredictionsPage() {
     sp.set("target_gw", String(applied.targetGw));
     sp.set("limit", String(applied.limit));
     sp.set("offset", String(offset));
-    sp.set("order_by", applied.orderBy); // backend expects: points|cost|value
+    sp.set("order_by", applied.orderBy);
 
     if (applied.modelName.trim()) sp.set("model_name", applied.modelName.trim());
     if (applied.position) sp.set("position", applied.position);
@@ -166,7 +192,6 @@ export default function PredictionsPage() {
     setApplied(nextApplied);
     setOffset(0);
 
-    // Fetch using the same values (avoid waiting for state updates)
     const sp = new URLSearchParams();
     sp.set("target_gw", String(nextApplied.targetGw));
     sp.set("limit", String(nextApplied.limit));
@@ -191,11 +216,6 @@ export default function PredictionsPage() {
     setOffset((o) => o + applied.limit);
   }
 
-  // Display mapping aligned to your backend response:
-  // - web_name
-  // - now_cost (int, 0.1m units)
-  // - predicted_points
-  // - team_short_name
   function rowView(r: PredictionRow) {
     const name = pick(r, ["name", "player_name", "web_name"], "");
     const pos = pick(r, ["position", "pos"], "");
@@ -205,27 +225,28 @@ export default function PredictionsPage() {
     const costM = nowCost !== null ? nowCost / 10 : num(pick(r, ["cost_m", "cost"], null));
 
     const pred = num(pick(r, ["predicted_points", "points", "pred_points"], null));
-
     const valueComputed = pred !== null && costM !== null && costM > 0 ? pred / costM : null;
 
     return { name, pos, team: teamShown, cost: costM, pred, value: valueComputed };
   }
 
-  // ✅ Front-end sorting for current page (supports asc/desc even if backend doesn't)
+  // Client-side sorting for current page
   const sortedRows = useMemo(() => {
     const arr = [...rows];
     const dir = applied.sortDir;
 
     const keyFn = (r: PredictionRow) => {
       const pred = num(pick(r, ["predicted_points", "points", "pred_points"], null)) ?? -1;
+
       const nowCost = num(pick(r, ["now_cost"], null));
       const costM =
         nowCost !== null ? nowCost / 10 : (num(pick(r, ["cost_m", "cost"], null)) ?? -1);
+
       const value = costM > 0 ? pred / costM : -1;
 
       if (applied.orderBy === "points") return pred;
       if (applied.orderBy === "cost") return costM;
-      return value; // "value"
+      return value;
     };
 
     arr.sort((a, b) => {
@@ -246,11 +267,11 @@ export default function PredictionsPage() {
       <header className="space-y-1">
         <h1 className="text-2xl font-bold">Predictions</h1>
         <p className="text-sm text-gray-600">
-          Day17: manual fetch; paging auto refresh; client-side asc/desc sorting for current page.
+          Day18: Team dropdown loads from backend <code className="px-1 py-0.5 border rounded">/teams</code>.
+          Manual fetch; paging auto refresh; per-page asc/desc sorting.
         </p>
       </header>
 
-      {/* Filters */}
       <section className="border rounded-lg p-4 space-y-4">
         <div className="grid grid-cols-1 md:grid-cols-6 gap-3">
           <label className="flex flex-col gap-1">
@@ -289,14 +310,13 @@ export default function PredictionsPage() {
             </select>
           </label>
 
-          {/* ✅ Status dropdown */}
           <label className="flex flex-col gap-1">
             <span className="text-sm font-medium">status</span>
             <select
               className="border rounded px-2 py-1"
               value={status}
               onChange={(e) => setStatus(e.target.value as Status)}
-              title="Common statuses: a=available, i=injured, u=unavailable, s=suspended"
+              title="a=available, i=injured, u=unavailable, s=suspended"
             >
               <option value="">(any)</option>
               <option value="a">a (available)</option>
@@ -306,7 +326,6 @@ export default function PredictionsPage() {
             </select>
           </label>
 
-          {/* ✅ Team dropdown (team_id), short label */}
           <label className="flex flex-col gap-1">
             <span className="text-sm font-medium">team</span>
             <select
@@ -317,10 +336,10 @@ export default function PredictionsPage() {
                 setTeamId(v === "" ? "" : Number(v));
               }}
             >
-              <option value="">(any)</option>
-              {TEAMS.map((t) => (
+              <option value="">{teamsLoading ? "Loading teams..." : "(any)"}</option>
+              {teams.map((t) => (
                 <option key={t.id} value={t.id}>
-                  {t.name} ({t.short})
+                  {t.name} ({t.short_name})
                 </option>
               ))}
             </select>
@@ -339,7 +358,6 @@ export default function PredictionsPage() {
             </select>
           </label>
 
-          {/* ✅ asc/desc (client-side sort for current page) */}
           <label className="flex flex-col gap-1">
             <span className="text-sm font-medium">sort_dir</span>
             <select
@@ -418,6 +436,13 @@ export default function PredictionsPage() {
           </div>
         </div>
 
+        {teamsErr ? (
+          <div className="border rounded-md p-3 bg-yellow-50 text-yellow-900 text-sm">
+            <div className="font-semibold">Teams load warning</div>
+            <div className="break-words">{teamsErr}</div>
+          </div>
+        ) : null}
+
         {err ? (
           <div className="border rounded-md p-3 bg-red-50 text-red-800 text-sm">
             <div className="font-semibold">Error</div>
@@ -426,7 +451,6 @@ export default function PredictionsPage() {
         ) : null}
       </section>
 
-      {/* Pagination */}
       <section className="flex items-center justify-between">
         <div className="text-sm text-gray-600">
           Showing <span className="font-medium">{sortedRows.length}</span> rows
@@ -450,7 +474,6 @@ export default function PredictionsPage() {
         </div>
       </section>
 
-      {/* Table */}
       <section className="border rounded-lg overflow-hidden">
         <div className="overflow-x-auto">
           <table className="min-w-full text-sm">
