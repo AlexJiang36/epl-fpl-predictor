@@ -35,6 +35,12 @@ function extractRows(payload: any): PredictionRow[] {
   return [];
 }
 
+function extractTotal(payload: any): number | null {
+  const t = payload?.meta?.total;
+  const n = Number(t);
+  return Number.isFinite(n) ? n : null;
+}
+
 export default function PredictionsPage() {
   // -----------------------
   // Draft (form inputs)
@@ -51,7 +57,7 @@ export default function PredictionsPage() {
   const [limit, setLimit] = useState<number>(20);
 
   // -----------------------
-  // Applied (used for query)
+  // Applied (used for the dataset fetch)
   // -----------------------
   const [applied, setApplied] = useState({
     targetGw: 26,
@@ -66,14 +72,17 @@ export default function PredictionsPage() {
     limit: 20,
   });
 
-  // Pagination offset is "applied" (Prev/Next should refresh)
+  // Day19: offset is ONLY for client-side pagination (slice)
   const [offset, setOffset] = useState<number>(0);
 
-  const [rows, setRows] = useState<PredictionRow[]>([]);
+  // Day19: store the full dataset for current applied filters
+  const [allRows, setAllRows] = useState<PredictionRow[]>([]);
+  const [total, setTotal] = useState<number>(0);
+
   const [loading, setLoading] = useState(false);
   const [err, setErr] = useState<string | null>(null);
 
-  // Whether user has ever fetched at least once (to enable auto refresh on paging)
+  // Whether user has fetched at least once
   const [hasFetched, setHasFetched] = useState(false);
 
   // -----------------------
@@ -95,7 +104,6 @@ export default function PredictionsPage() {
         throw new Error(msg);
       }
 
-      // backend shape: { teams: [{id,fpl_team_id,name,short_name}, ...] }
       const listRaw = Array.isArray(body?.teams) ? body.teams : [];
       const list: TeamOpt[] = listRaw
         .map((t: any) => ({
@@ -125,13 +133,19 @@ export default function PredictionsPage() {
   const canFetchDraft =
     Number.isFinite(targetGw) && targetGw > 0 && Number.isFinite(limit) && limit > 0;
 
-  // Query string is based on APPLIED filters + offset
-  const appliedQueryString = useMemo(() => {
+  // Build query string for the dataset fetch (Day19: we fetch "all rows" once)
+  const datasetQueryString = useMemo(() => {
     const sp = new URLSearchParams();
     sp.set("target_gw", String(applied.targetGw));
-    sp.set("limit", String(applied.limit));
-    sp.set("offset", String(offset));
-    sp.set("order_by", applied.orderBy);
+
+    // fetch all: pick a high limit that exceeds total players (safe for your scale)
+    // If you later grow to bigger datasets, we can loop pages; not needed now.
+    sp.set("limit", "200");
+    sp.set("offset", "0");
+
+    // backend needs order_by, but Day19 does global sorting on client
+    // keep it stable (doesn't matter much). Use cost for determinism.
+    sp.set("order_by", "cost");
 
     if (applied.modelName.trim()) sp.set("model_name", applied.modelName.trim());
     if (applied.position) sp.set("position", applied.position);
@@ -141,37 +155,65 @@ export default function PredictionsPage() {
     if (applied.minPredPts !== "") sp.set("min_predicted_points", String(applied.minPredPts));
 
     return sp.toString();
-  }, [applied, offset]);
+  }, [applied]);
 
-  async function doFetch(qs: string) {
+  async function fetchAllPredictions(appliedQS: URLSearchParams) {
     setLoading(true);
     setErr(null);
+
     try {
-      const res = await fetch(`/api/predictions?${qs}`, { cache: "no-store" });
-      const body = await res.json();
+        const PAGE_LIMIT = 200; // keep within backend validation
+        let pageOffset = 0;
 
-      if (!res.ok) {
-        const msg = body?.error?.message || body?.message || `Request failed (${res.status})`;
-        throw new Error(msg);
-      }
+        const merged: PredictionRow[] = [];
+        let totalSeen: number | null = null;
 
-      setRows(extractRows(body));
-      setHasFetched(true);
+        while (true) {
+        const sp = new URLSearchParams(appliedQS.toString());
+        sp.set("limit", String(PAGE_LIMIT));
+        sp.set("offset", String(pageOffset));
+        // backend requires order_by; stable value is fine because we sort client-side later
+        sp.set("order_by", "cost");
+
+        const res = await fetch(`/api/predictions?${sp.toString()}`, { cache: "no-store" });
+        const body = await res.json();
+
+        if (!res.ok) {
+            const msg = body?.error?.message || body?.message || `Request failed (${res.status})`;
+            throw new Error(msg);
+        }
+
+        const rows = extractRows(body);
+        const t = extractTotal(body);
+        if (t !== null) totalSeen = t;
+
+        merged.push(...rows);
+
+        // stop conditions:
+        // 1) backend tells total, and we reached it
+        if (totalSeen !== null && merged.length >= totalSeen) break;
+
+        // 2) backend returned fewer than PAGE_LIMIT rows => no more pages
+        if (rows.length < PAGE_LIMIT) break;
+
+        pageOffset += PAGE_LIMIT;
+
+        // safety guard to avoid infinite loops
+        if (pageOffset > 5000) break;
+        }
+
+        setAllRows(merged);
+        setTotal(totalSeen ?? merged.length);
+        setHasFetched(true);
     } catch (e) {
-      const msg = e instanceof Error ? e.message : "Unknown error";
-      setErr(msg);
-      setRows([]);
+        const msg = e instanceof Error ? e.message : "Unknown error";
+        setErr(msg);
+        setAllRows([]);
+        setTotal(0);
     } finally {
-      setLoading(false);
+        setLoading(false);
     }
-  }
-
-  // ✅ Auto-refresh ONLY when paging changes (Prev/Next), after user has fetched once
-  useEffect(() => {
-    if (!hasFetched) return;
-    doFetch(appliedQueryString);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [offset]);
+}
 
   function onApplyAndFetch() {
     if (!canFetchDraft) return;
@@ -192,11 +234,12 @@ export default function PredictionsPage() {
     setApplied(nextApplied);
     setOffset(0);
 
+    // Build QS from nextApplied (avoid waiting for state updates)
     const sp = new URLSearchParams();
     sp.set("target_gw", String(nextApplied.targetGw));
-    sp.set("limit", String(nextApplied.limit));
+    sp.set("limit", "200");
     sp.set("offset", "0");
-    sp.set("order_by", nextApplied.orderBy);
+    sp.set("order_by", "cost");
 
     if (nextApplied.modelName.trim()) sp.set("model_name", nextApplied.modelName.trim());
     if (nextApplied.position) sp.set("position", nextApplied.position);
@@ -205,7 +248,7 @@ export default function PredictionsPage() {
     if (nextApplied.maxCost !== "") sp.set("max_cost", String(nextApplied.maxCost));
     if (nextApplied.minPredPts !== "") sp.set("min_predicted_points", String(nextApplied.minPredPts));
 
-    doFetch(sp.toString());
+    fetchAllPredictions(sp);
   }
 
   function onPrev() {
@@ -230,10 +273,10 @@ export default function PredictionsPage() {
     return { name, pos, team: teamShown, cost: costM, pred, value: valueComputed };
   }
 
-  // Client-side sorting for current page
-  const sortedRows = useMemo(() => {
-    const arr = [...rows];
+  // ✅ Day19: global sorting on ALL rows
+  const globallySortedRows = useMemo(() => {
     const dir = applied.sortDir;
+    const arr = [...allRows];
 
     const keyFn = (r: PredictionRow) => {
       const pred = num(pick(r, ["predicted_points", "points", "pred_points"], null)) ?? -1;
@@ -246,7 +289,7 @@ export default function PredictionsPage() {
 
       if (applied.orderBy === "points") return pred;
       if (applied.orderBy === "cost") return costM;
-      return value;
+      return value; // value
     };
 
     arr.sort((a, b) => {
@@ -256,22 +299,43 @@ export default function PredictionsPage() {
     });
 
     return arr;
-  }, [rows, applied.orderBy, applied.sortDir]);
+  }, [allRows, applied.orderBy, applied.sortDir]);
+
+  // ✅ Day19: paginate AFTER sorting
+  const pageRows = useMemo(() => {
+    const start = offset;
+    const end = offset + applied.limit;
+    return globallySortedRows.slice(start, end);
+  }, [globallySortedRows, offset, applied.limit]);
+
+  const totalPagesInfo = useMemo(() => {
+    const t = total || globallySortedRows.length;
+    const start = t === 0 ? 0 : offset + 1;
+    const end = Math.min(offset + applied.limit, t);
+    return { t, start, end };
+  }, [total, globallySortedRows.length, offset, applied.limit]);
 
   const requestHref = useMemo(() => {
-    return `http://localhost:3000/api/predictions?${appliedQueryString}`;
-  }, [appliedQueryString]);
+    // show the dataset fetch request (single fetch)
+    return `http://localhost:3000/api/predictions?${datasetQueryString}`;
+  }, [datasetQueryString]);
+
+  const disableNext = useMemo(() => {
+    const t = totalPagesInfo.t;
+    return !hasFetched || loading || offset + applied.limit >= t;
+  }, [hasFetched, loading, offset, applied.limit, totalPagesInfo.t]);
 
   return (
     <main className="max-w-6xl mx-auto p-6 space-y-6">
       <header className="space-y-1">
         <h1 className="text-2xl font-bold">Predictions</h1>
         <p className="text-sm text-gray-600">
-          Day18: Team dropdown loads from backend <code className="px-1 py-0.5 border rounded">/teams</code>.
-          Manual fetch; paging auto refresh; per-page asc/desc sorting.
+          Day19: fetch full dataset once → <b>global sort</b> → <b>client paginate</b>. Manual fetch; no
+          auto refresh on typing.
         </p>
       </header>
 
+      {/* Filters */}
       <section className="border rounded-lg p-4 space-y-4">
         <div className="grid grid-cols-1 md:grid-cols-6 gap-3">
           <label className="flex flex-col gap-1">
@@ -364,7 +428,7 @@ export default function PredictionsPage() {
               className="border rounded px-2 py-1"
               value={sortDir}
               onChange={(e) => setSortDir(e.target.value as SortDir)}
-              title="Client-side sorting for the current page"
+              title="Global sorting is applied BEFORE pagination in Day19"
             >
               <option value="desc">desc</option>
               <option value="asc">asc</option>
@@ -428,9 +492,9 @@ export default function PredictionsPage() {
             </button>
 
             <div className="text-xs text-gray-500 break-all">
-              Request:{" "}
+              Dataset request:{" "}
               <a className="underline" href={requestHref} target="_blank" rel="noreferrer">
-                /api/predictions?{appliedQueryString}
+                /api/predictions?{datasetQueryString}
               </a>
             </div>
           </div>
@@ -451,10 +515,20 @@ export default function PredictionsPage() {
         ) : null}
       </section>
 
+      {/* Pagination info */}
       <section className="flex items-center justify-between">
         <div className="text-sm text-gray-600">
-          Showing <span className="font-medium">{sortedRows.length}</span> rows
+          {hasFetched ? (
+            <>
+              Showing <span className="font-medium">{totalPagesInfo.start}</span>–
+              <span className="font-medium">{totalPagesInfo.end}</span> of{" "}
+              <span className="font-medium">{totalPagesInfo.t}</span> (global-sorted)
+            </>
+          ) : (
+            <>No rows. Click “Fetch Predictions”.</>
+          )}
         </div>
+
         <div className="flex gap-2">
           <button
             className="border rounded px-3 py-1 disabled:opacity-60"
@@ -463,17 +537,13 @@ export default function PredictionsPage() {
           >
             Prev
           </button>
-          <button
-            className="border rounded px-3 py-1 disabled:opacity-60"
-            onClick={onNext}
-            disabled={loading || !hasFetched || rows.length < applied.limit}
-            title={rows.length < applied.limit ? "No more pages (returned less than limit)" : ""}
-          >
+          <button className="border rounded px-3 py-1 disabled:opacity-60" onClick={onNext} disabled={disableNext}>
             Next
           </button>
         </div>
       </section>
 
+      {/* Table */}
       <section className="border rounded-lg overflow-hidden">
         <div className="overflow-x-auto">
           <table className="min-w-full text-sm">
@@ -488,14 +558,14 @@ export default function PredictionsPage() {
               </tr>
             </thead>
             <tbody>
-              {sortedRows.length === 0 ? (
+              {pageRows.length === 0 ? (
                 <tr>
                   <td className="px-3 py-3 text-gray-500" colSpan={6}>
                     {hasFetched ? "No rows for current filters." : 'No rows. Click "Fetch Predictions".'}
                   </td>
                 </tr>
               ) : (
-                sortedRows.map((r, i) => {
+                pageRows.map((r, i) => {
                   const v = rowView(r);
                   return (
                     <tr key={i} className="hover:bg-gray-50">
