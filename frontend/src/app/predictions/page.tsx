@@ -10,6 +10,14 @@ type Status = "" | "a" | "i" | "u" | "s";
 
 type TeamOpt = { id: number; name: string; short_name: string; fpl_team_id?: number };
 
+type ModelOpt = {
+  model_name: string;
+  label: string;
+  source?: string;
+  is_active?: boolean;
+  notes?: string | null;
+};
+
 function num(v: any): number | null {
   const n = Number(v);
   return Number.isFinite(n) ? n : null;
@@ -72,6 +80,11 @@ export default function PredictionsPage() {
     limit: 20,
   });
 
+  // Day23: dynamic model registry (models dropdown)
+    const [models, setModels] = useState<ModelOpt[]>([]);
+    const [modelsLoading, setModelsLoading] = useState(false);
+    const [modelsErr, setModelsErr] = useState<string | null>(null);
+
   // Day19: offset is ONLY for client-side pagination (slice)
   const [offset, setOffset] = useState<number>(0);
 
@@ -124,9 +137,51 @@ export default function PredictionsPage() {
       setTeamsLoading(false);
     }
   }
+  async function loadModels() {
+    setModelsLoading(true);
+    setModelsErr(null);
+    try {
+        const res = await fetch("/api/models", { cache: "no-store" });
+        const body = await res.json();
+
+        if (!res.ok) {
+        const msg = body?.error?.message || body?.message || `Request failed (${res.status})`;
+        throw new Error(msg);
+        }
+
+        const listRaw = Array.isArray(body?.models) ? body.models : [];
+        const list: ModelOpt[] = listRaw
+        .map((m: any) => ({
+            model_name: String(m.model_name ?? ""),
+            label: String(m.label ?? m.model_name ?? ""),
+            source: m.source ? String(m.source) : undefined,
+            is_active: m.is_active !== undefined ? Boolean(m.is_active) : undefined,
+            notes: m.notes ?? null,
+        }))
+        .filter((m: ModelOpt) => m.model_name.length > 0);
+
+        list.sort((a, b) => a.label.localeCompare(b.label));
+        setModels(list);
+
+        // Optional: if current input is empty and baseline exists, keep default UX smooth
+        // (No forced override if user already typed/chose something)
+        if (!modelName) {
+        const baseline = list.find((m) => m.model_name === "baseline_rollavg_v0");
+        if (baseline) setModelName(baseline.model_name);
+        }
+    } catch (e) {
+        const msg = e instanceof Error ? e.message : "Unknown error";
+        setModelsErr(msg);
+        setModels([]);
+    } finally {
+        setModelsLoading(false);
+    }
+}
+
 
   useEffect(() => {
     loadTeams();
+    loadModels();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -330,8 +385,7 @@ export default function PredictionsPage() {
       <header className="space-y-1">
         <h1 className="text-2xl font-bold">Predictions</h1>
         <p className="text-sm text-gray-600">
-          Day19: fetch full dataset once → <b>global sort</b> → <b>client paginate</b>. Manual fetch; no
-          auto refresh on typing.
+          Filter player predictions by gameweek, team, position, status, and model.
         </p>
       </header>
 
@@ -351,13 +405,22 @@ export default function PredictionsPage() {
 
           <label className="flex flex-col gap-1">
             <span className="text-sm font-medium">model_name</span>
-            <input
-              className="border rounded px-2 py-1"
-              placeholder="(optional)"
-              value={modelName}
-              onChange={(e) => setModelName(e.target.value)}
-            />
-          </label>
+            <select
+                className="border rounded px-2 py-1"
+                value={modelName}
+                onChange={(e) => setModelName(e.target.value)}
+                title="Dynamic model list from /api/models (Day23)"
+            >
+                <option value="">
+                {modelsLoading ? "Loading models..." : "(any)"}
+                </option>
+                {models.map((m) => (
+                <option key={m.model_name} value={m.model_name}>
+                    {m.label}
+                </option>
+                ))}
+            </select>
+        </label>
 
           <label className="flex flex-col gap-1">
             <span className="text-sm font-medium">position</span>
@@ -505,6 +568,12 @@ export default function PredictionsPage() {
             <div className="font-semibold">Teams load warning</div>
             <div className="break-words">{teamsErr}</div>
           </div>
+        ) : null}
+        {modelsErr ? (
+            <div className="border rounded-md p-3 bg-yellow-50 text-yellow-900 text-sm">
+                <div className="font-semibold">Models load warning</div>
+                <div className="break-words">{modelsErr}</div>
+            </div>
         ) : null}
 
         {err ? (

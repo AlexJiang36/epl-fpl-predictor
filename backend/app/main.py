@@ -10,6 +10,7 @@ from app.api.routes.player_gw_stats import router as player_gw_stats_router
 from app.api.routes.ingest_gw_stats import router as ingest_gw_stats_router
 from app.api.routes.predictions import router as predictions_router
 from app.api.routes.recommendations import router as recommendations_router
+from app.api.routes import models
 
 
 app = FastAPI(title="EPL/FPL Predictor")
@@ -25,3 +26,4 @@ app.include_router(player_gw_stats_router)
 app.include_router(ingest_gw_stats_router)
 app.include_router(predictions_router)
 app.include_router(recommendations_router)
+app.include_router(models.router)
