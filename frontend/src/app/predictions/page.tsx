@@ -49,9 +49,23 @@ function pick(row: PredictionRow, keys: string[], fallback: any = undefined) {
   return fallback;
 }
 
-function fmt1(n: number | null) {
+function fmtDec(n: number | null, decimals: number) {
   if (n === null) return "-";
-  return (Math.round(n * 10) / 10).toString();
+  const p = Math.pow(10, decimals);
+  const v = Math.round(n * p) / p;
+  return v.toFixed(decimals);
+}
+
+function fmtCost(n: number | null) {
+  return fmtDec(n, 1); // e.g., 7.5m
+}
+
+function fmtPts(n: number | null) {
+  return fmtDec(n, 1);
+}
+
+function fmtValue(n: number | null) {
+  return fmtDec(n, 2);
 }
 
 function extractRows(payload: any): PredictionRow[] {
@@ -385,6 +399,81 @@ export default function PredictionsPage() {
 
   const requestHref = useMemo(() => `/api/predictions?${datasetQueryString}`, [datasetQueryString]);
 
+  // Day25: show draft vs applied filter state clearly
+  const hasDraftChanges = useMemo(() => {
+    const dModel = modelName.trim();
+    const aModel = applied.modelName.trim();
+
+    return (
+      targetGw !== applied.targetGw ||
+      dModel !== aModel ||
+      position !== applied.position ||
+      status !== applied.status ||
+      teamId !== applied.teamId ||
+      maxCostM !== applied.maxCostM ||
+      minPredPts !== applied.minPredPts ||
+      orderBy !== applied.orderBy ||
+      sortDir !== applied.sortDir ||
+      limit !== applied.limit
+    );
+  }, [
+    targetGw,
+    modelName,
+    position,
+    status,
+    teamId,
+    maxCostM,
+    minPredPts,
+    orderBy,
+    sortDir,
+    limit,
+    applied,
+  ]);
+
+  const appliedTeamLabel = useMemo(() => {
+    if (applied.teamId === "") return null;
+    const t = teams.find((x) => x.id === applied.teamId);
+    if (!t) return `team ${applied.teamId}`;
+    return `${t.name} (${t.short_name})`;
+  }, [applied.teamId, teams]);
+
+  const appliedModelLabel = useMemo(() => {
+    const name = applied.modelName.trim();
+    if (!name) return null;
+    const m = models.find((x) => x.model_name === name);
+    return m?.label || name;
+  }, [applied.modelName, models]);
+
+  const appliedChips = useMemo(() => {
+    const chips: Array<{ k: string; v: string }> = [];
+
+    chips.push({ k: "GW", v: String(applied.targetGw) });
+
+    if (appliedTeamLabel) chips.push({ k: "Team", v: appliedTeamLabel });
+    if (appliedModelLabel) chips.push({ k: "Model", v: appliedModelLabel });
+    if (applied.position) chips.push({ k: "Pos", v: applied.position });
+    if (applied.status) chips.push({ k: "Status", v: applied.status });
+
+    if (applied.maxCostM !== "") chips.push({ k: "Max cost", v: `${applied.maxCostM}m` });
+    if (applied.minPredPts !== "") chips.push({ k: "Min pts", v: String(applied.minPredPts) });
+
+    chips.push({ k: "Order", v: `${applied.orderBy} ${applied.sortDir}` });
+
+    return chips;
+  }, [
+    applied.targetGw,
+    applied.teamId,
+    applied.modelName,
+    applied.position,
+    applied.status,
+    applied.maxCostM,
+    applied.minPredPts,
+    applied.orderBy,
+    applied.sortDir,
+    appliedTeamLabel,
+    appliedModelLabel,
+  ]);
+
   return (
     <main className="max-w-6xl mx-auto p-6 space-y-6">
       <header className="space-y-1">
@@ -562,6 +651,12 @@ export default function PredictionsPage() {
               Reset Filters
             </button>
 
+            {hasFetched && hasDraftChanges ? (
+              <div className="text-xs text-amber-700">
+                Draft differs from applied filters — click “Fetch Predictions” to apply.
+              </div>
+            ) : null}
+
             <div className="text-xs text-gray-500 break-all">
               Dataset request:{" "}
               <a className="underline" href={requestHref} target="_blank" rel="noreferrer">
@@ -608,10 +703,22 @@ export default function PredictionsPage() {
           </div>
         </div>
 
-        <div className="overflow-x-auto">
-          <table className="min-w-full text-sm">
+        {hasFetched ? (
+          <div className="flex flex-wrap items-center gap-2 text-xs text-gray-600">
+            <span className="text-gray-500">Applied filters:</span>
+            {appliedChips.map((c) => (
+              <span key={c.k} className="inline-flex items-center rounded border px-2 py-0.5">
+                <span className="text-gray-500 mr-1">{c.k}:</span>
+                {c.v}
+              </span>
+            ))}
+          </div>
+        ) : null}
+
+        <div className="overflow-x-auto overflow-y-auto max-h-[60vh]">
+          <table className="min-w-full text-sm [font-variant-numeric:tabular-nums]">
             <thead>
-              <tr className="border-b">
+              <tr className="border-b sticky top-0 bg-white z-10">
                 <th className="text-left py-2 pr-4">Name</th>
                 <th className="text-left py-2 pr-4">Pos</th>
                 <th className="text-left py-2 pr-4">Team</th>
@@ -624,20 +731,26 @@ export default function PredictionsPage() {
               {pageRows.length === 0 ? (
                 <tr>
                   <td className="py-4 text-gray-500" colSpan={6}>
-                    {hasFetched ? "No rows." : 'No rows. Click "Fetch Predictions".'}
+                    {loading
+                      ? "Loading…"
+                      : err
+                      ? "Couldn’t load predictions. Check your filters and try Fetch again."
+                      : hasFetched
+                      ? "No rows match the applied filters."
+                      : 'No rows yet. Adjust filters, then click "Fetch Predictions".'}
                   </td>
                 </tr>
               ) : (
                 pageRows.map((r, idx) => {
                   const v = rowView(r);
                   return (
-                    <tr key={idx} className="border-b last:border-b-0">
+                    <tr key={idx} className="border-b last:border-b-0 hover:bg-gray-50">
                       <td className="py-2 pr-4">{v.name}</td>
                       <td className="py-2 pr-4">{v.pos}</td>
                       <td className="py-2 pr-4">{v.team}</td>
-                      <td className="py-2 pr-4 text-right">{fmt1(v.cost)}</td>
-                      <td className="py-2 pr-4 text-right">{fmt1(v.pred)}</td>
-                      <td className="py-2 pr-2 text-right">{fmt1(v.value)}</td>
+                      <td className="py-2 pr-4 text-right">{fmtCost(v.cost)}</td>
+                      <td className="py-2 pr-4 text-right">{fmtPts(v.pred)}</td>
+                      <td className="py-2 pr-2 text-right">{fmtValue(v.value)}</td>
                     </tr>
                   );
                 })
@@ -649,4 +762,3 @@ export default function PredictionsPage() {
     </main>
   );
 }
-
