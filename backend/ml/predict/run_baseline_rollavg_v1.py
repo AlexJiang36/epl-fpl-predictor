@@ -33,10 +33,27 @@ def main(target_gw: int, window: int = 5):
             return float((w * y).sum() / denom)
 
         preds = (
-            stats.groupby("player_id")  # no as_index=False here
-                .apply(wavg)
-                .reset_index(name="predicted_points")
+            stats.sort_values(["player_id", "gw"])
+                .groupby("player_id", as_index=False)
+                .agg(
+                    predicted_points=("total_points", "last")  # placeholder, overwritten below
+                )
 )
+
+        # compute weighted avg safely per player
+        def wavg_df(g):
+            g = g.tail(window)
+            w = g["minutes"].astype(float).clip(lower=0.0)
+            y = g["total_points"].astype(float)
+            denom = w.sum()
+            return float((w * y).sum() / denom) if denom > 0 else float(y.iloc[-1]) if len(y) else 0.0
+
+        preds["predicted_points"] = (
+            stats.sort_values(["player_id", "gw"])
+                .groupby("player_id")
+                .apply(wavg_df, include_groups=False)
+                .to_numpy()
+        )
 
         preds["target_gw"] = target_gw
         preds["model_name"] = MODEL_NAME
