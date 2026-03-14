@@ -1,6 +1,6 @@
 from typing import Optional
 
-from sqlalchemy import Integer, Boolean, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, Boolean, DateTime, ForeignKey
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -16,6 +16,8 @@ class Fixture(Base):
     # Teams
     home_team_id: Mapped[int] = mapped_column(ForeignKey("teams.id"), index=True)
     away_team_id: Mapped[int] = mapped_column(ForeignKey("teams.id"), index=True)
+
+    gw = Column(Integer, nullable=True, index=True)
 
     # Kickoff time in UTC (from FPL)
     kickoff_time: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True), nullable=True)
