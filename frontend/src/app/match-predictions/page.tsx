@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useState } from "react";
+import React, { useEffect, useState } from "react";
 
 type Row = {
   fixture_id: number;
@@ -15,12 +15,61 @@ type Row = {
   found: boolean;
 };
 
+type ModelsResponse = {
+  models?: string[];
+  meta?: any;
+};
+
 export default function MatchPredictionsPage() {
   const [gw, setGw] = useState<number>(30);
+
+  // dropdown models
+  const [models, setModels] = useState<string[]>([]);
   const [modelName, setModelName] = useState<string>("match_baseline_v0");
+
   const [rows, setRows] = useState<Row[]>([]);
   const [loading, setLoading] = useState(false);
+  const [loadingModels, setLoadingModels] = useState(false);
   const [err, setErr] = useState<string | null>(null);
+
+  useEffect(() => {
+    let cancelled = false;
+
+    async function loadModels() {
+      setLoadingModels(true);
+      try {
+        const res = await fetch("/api/match/models", { cache: "no-store" });
+        const text = await res.text();
+        if (!res.ok) throw new Error(text || `Failed to load models (${res.status})`);
+
+        const data = JSON.parse(text) as ModelsResponse;
+        const list = Array.isArray(data.models) ? data.models : [];
+
+        if (!cancelled) {
+          setModels(list);
+
+          // If current model isn't in the list, default to first available.
+          if (list.length > 0 && !list.includes(modelName)) {
+            setModelName(list[0]);
+          }
+        }
+      } catch (e) {
+        if (!cancelled) {
+          // Keep existing modelName; allow manual fetch even if models endpoint fails.
+          setModels([]);
+        }
+      } finally {
+        if (!cancelled) setLoadingModels(false);
+      }
+    }
+
+    loadModels();
+    return () => {
+      cancelled = true;
+    };
+    // intentionally run once on mount
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   async function onFetch() {
     setLoading(true);
@@ -32,6 +81,7 @@ export default function MatchPredictionsPage() {
       );
       const text = await res.text();
       if (!res.ok) throw new Error(text || `Request failed (${res.status})`);
+
       const data = JSON.parse(text);
       setRows(data.rows ?? []);
     } catch (e) {
@@ -66,11 +116,32 @@ export default function MatchPredictionsPage() {
 
           <label className="flex flex-col gap-1">
             <span className="text-sm font-medium">model_name</span>
-            <input
+            <select
               className="border rounded px-2 py-1"
               value={modelName}
               onChange={(e) => setModelName(e.target.value)}
-            />
+              disabled={loadingModels}
+            >
+              {models.length === 0 ? (
+                <option value={modelName}>
+                  {loadingModels ? "Loading..." : modelName}
+                </option>
+              ) : (
+                models.map((m) => (
+                  <option key={m} value={m}>
+                    {m}
+                  </option>
+                ))
+              )}
+            </select>
+
+            <div className="text-xs text-gray-500">
+              {loadingModels
+                ? "Loading models…"
+                : models.length > 0
+                ? `${models.length} models available`
+                : "Models endpoint unavailable (fallback to current value)."}
+            </div>
           </label>
 
           <div className="flex items-end">
@@ -101,19 +172,14 @@ export default function MatchPredictionsPage() {
           <tbody>
             {rows.map((r) => (
               <tr key={r.fixture_id} className="border-b">
-                <td className="py-2 pr-3 whitespace-nowrap">
-                  {r.kickoff_time ?? "-"}
-                </td>
+                <td className="py-2 pr-3 whitespace-nowrap">{r.kickoff_time ?? "-"}</td>
                 <td className="py-2 pr-3">
                   {r.home_team_name} vs {r.away_team_name}
                 </td>
                 <td className="py-2 pr-3 tabular-nums whitespace-nowrap">
-                  {fmt3(r.pred_home_win)} / {fmt3(r.pred_draw)} /{" "}
-                  {fmt3(r.pred_away_win)}
+                  {fmt3(r.pred_home_win)} / {fmt3(r.pred_draw)} / {fmt3(r.pred_away_win)}
                 </td>
-                <td className="py-2 pr-3 font-semibold">
-                  {r.pred_result ?? "-"}
-                </td>
+                <td className="py-2 pr-3 font-semibold">{r.pred_result ?? "-"}</td>
                 <td className="py-2 pr-3 tabular-nums">{r.fixture_id}</td>
               </tr>
             ))}

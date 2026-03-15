@@ -13,6 +13,8 @@ from app.api.routes.recommendations import router as recommendations_router
 from app.api.routes import models
 from app.api.routes.h2h import router as h2h_router
 from app.api.routes.match_predictions import router as match_predictions_router
+from app.api.routes.team_form import router as team_form_router
+
 
 
 app = FastAPI(title="EPL/FPL Predictor")
@@ -31,3 +33,4 @@ app.include_router(recommendations_router)
 app.include_router(models.router)
 app.include_router(h2h_router)
 app.include_router(match_predictions_router)
+app.include_router(team_form_router)

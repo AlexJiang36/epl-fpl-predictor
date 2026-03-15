@@ -237,3 +237,16 @@ def list_match_predictions(
         )
 
     return {"meta": {"gw": gw, "model_name": model_name, "count": len(rows)}, "rows": rows}
+
+@router.get("/models")
+def list_match_models(db: Session = Depends(get_db)):
+    rows = (
+        db.query(MatchPrediction.model_name)
+        .filter(MatchPrediction.model_name.isnot(None))
+        .filter(MatchPrediction.model_name != "")
+        .distinct()
+        .order_by(MatchPrediction.model_name.asc())
+        .all()
+    )
+    model_names = [r[0] for r in rows if r and r[0]]
+    return {"models": model_names, "meta": {"count": len(model_names), "source": "match_predictions_distinct"}}
