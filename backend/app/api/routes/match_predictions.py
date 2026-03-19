@@ -250,3 +250,112 @@ def list_match_models(db: Session = Depends(get_db)):
     )
     model_names = [r[0] for r in rows if r and r[0]]
     return {"models": model_names, "meta": {"count": len(model_names), "source": "match_predictions_distinct"}}
+
+@router.post("/run_gw")
+def run_match_baseline_for_gw(
+    gw: int = Query(..., ge=1),
+    n: int = Query(5, ge=1, le=20),
+    model_name: str = Query(DEFAULT_MODEL_NAME),
+    threshold: float = Query(0.30, ge=0.0, le=2.0),
+    db: Session = Depends(get_db),
+):
+    # 1) load fixtures for the GW (kickoff_time required)
+    fixtures = (
+        db.query(Fixture)
+        .filter(Fixture.gw == gw)
+        .filter(Fixture.kickoff_time.isnot(None))
+        .order_by(Fixture.kickoff_time.asc())
+        .all()
+    )
+
+    if not fixtures:
+        return {"ok": False, "error": f"No fixtures found for gw={gw} (kickoff_time is required)."}
+
+    # 2) run baseline for each fixture (reuse the same logic as /run)
+    results = []
+    success = 0
+    failed = 0
+
+    for f in fixtures:
+        try:
+            home_id = f.home_team_id
+            away_id = f.away_team_id
+
+            # Team name lookup
+            team_rows = db.query(Team.id, Team.name).filter(Team.id.in_([home_id, away_id])).all()
+            team_map = {tid: name for tid, name in team_rows}
+            home_name = team_map.get(home_id, f"Unknown({home_id})")
+            away_name = team_map.get(away_id, f"Unknown({away_id})")
+
+            home_avg = recent_form_avg_points(db, home_id, f.kickoff_time, n)
+            away_avg = recent_form_avg_points(db, away_id, f.kickoff_time, n)
+            diff = home_avg - away_avg
+
+            if diff > threshold:
+                pred_result = "H"
+            elif diff < -threshold:
+                pred_result = "A"
+            else:
+                pred_result = "D"
+
+            scale = 1.0
+            pH, pD, pA = softmax3(scale * diff, 0.0, -scale * diff)
+
+            # idempotent write
+            db.query(MatchPrediction).filter(
+                MatchPrediction.fixture_id == f.id,
+                MatchPrediction.model_name == model_name,
+            ).delete()
+
+            row = MatchPrediction(
+                fixture_id=f.id,
+                model_name=model_name,
+                pred_home_win=float(pH),
+                pred_draw=float(pD),
+                pred_away_win=float(pA),
+                pred_result=pred_result,
+            )
+            db.add(row)
+            db.commit()
+            db.refresh(row)
+
+            success += 1
+            results.append(
+                {
+                    "fixture_id": f.id,
+                    "gw": gw,
+                    "kickoff_time": f.kickoff_time.isoformat() if f.kickoff_time else None,
+                    "home_team_id": home_id,
+                    "home_team_name": home_name,
+                    "away_team_id": away_id,
+                    "away_team_name": away_name,
+                    "pred_home_win": float(pH),
+                    "pred_draw": float(pD),
+                    "pred_away_win": float(pA),
+                    "pred_result": pred_result,
+                }
+            )
+        except Exception as e:
+            db.rollback()
+            failed += 1
+            results.append(
+                {
+                    "fixture_id": getattr(f, "id", None),
+                    "gw": gw,
+                    "error": str(e),
+                }
+            )
+
+    return {
+        "ok": True,
+        "meta": {
+            "gw": gw,
+            "model_name": model_name,
+            "n_form": n,
+            "threshold": threshold,
+            "fixtures_total": len(fixtures),
+            "success": success,
+            "failed": failed,
+        },
+        "results": results,
+    }
