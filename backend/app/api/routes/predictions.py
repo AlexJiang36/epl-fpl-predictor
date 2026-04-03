@@ -90,18 +90,12 @@ def serialize_prediction_row(pred: Prediction, pl: Player, tm: Team):
         "team_name": tm.name,
     }
 
-
-@router.post("/baseline/run")
-def run_baseline(
-    target_gw: Optional[int] = None,
-    window: int = Query(default=5, ge=1, le=10),
-    db: Session = Depends(get_db),
-):
-    """
-    Baseline: predict points as the average total_points over last N finished GWs.
-    Writes results into predictions table (upsert by player_id+target_gw+model_name).
-    """
-    # 1) decide target_gw: if not provided, use next gameweek
+def run_baseline_rollavg_v0_core(
+    *,
+    db: Session,
+    target_gw: Optional[int],
+    window: int,
+) -> dict:
     if target_gw is None:
         nxt = (
             db.execute(select(Gameweek).where(Gameweek.is_next == True))
@@ -112,12 +106,13 @@ def run_baseline(
             return {"error": "No next gameweek found. Run /gameweeks/ingest/fpl first."}
         target_gw = nxt.gw
 
-    # 2) pick last N finished gameweeks (by gw desc)
     finished_gws = (
         db.execute(
             select(Gameweek.gw)
-            .where(Gameweek.is_finished == True,
-                   Gameweek.gw < target_gw)
+            .where(
+                Gameweek.is_finished == True,
+                Gameweek.gw < target_gw,
+            )
             .order_by(Gameweek.gw.desc())
             .limit(window)
         )
@@ -130,7 +125,6 @@ def run_baseline(
 
     finished_gws_sorted = sorted(finished_gws)
 
-    # 3) aggregate avg points per player over those GWs
     rows = db.execute(
         select(
             PlayerGameweekStat.player_id,
@@ -143,7 +137,6 @@ def run_baseline(
     inserted = 0
     updated = 0
 
-    # 4) upsert into predictions
     for player_id, avg_points in rows:
         avg_points = float(avg_points or 0.0)
 
@@ -185,6 +178,17 @@ def run_baseline(
         "total_players_predicted": len(rows),
     }
 
+@router.post("/baseline/run")
+def run_baseline(
+    target_gw: Optional[int] = None,
+    window: int = Query(default=5, ge=1, le=10),
+    db: Session = Depends(get_db),
+):
+    return run_baseline_rollavg_v0_core(
+        db=db,
+        target_gw=target_gw,
+        window=window,
+    )
 
 @router.get("")
 def list_predictions(
