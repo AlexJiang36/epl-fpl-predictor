@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Literal, Tuple
+from pydantic import BaseModel, Field
 
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy import select, func as sa_func
@@ -742,3 +743,152 @@ def recommend_squad(
         "squad_list": squad_list,   # 15 flat
     }
 
+class TransferRecommendationsRequest(BaseModel):
+    target_gw: int
+    model_name: str
+    squad_player_ids: List[int]
+    bank: int = Field(default=0, ge=0)
+    free_transfers: int = Field(default=1, ge=0)
+    limit: int = Field(default=10, ge=1, le=50)
+    allow_points_hit: bool = False
+
+
+@router.post("/transfers")
+def recommend_transfers(
+    req: TransferRecommendationsRequest,
+    db: Session = Depends(get_db),
+):
+    # 1) Find current squad players with predictions for this GW/model
+    outgoing_stmt = (
+        select(Prediction, Player, Team)
+        .join(Player, Player.id == Prediction.player_id)
+        .join(Team, Team.id == Player.team_id)
+        .where(
+            Prediction.target_gw == req.target_gw,
+            Prediction.model_name == req.model_name,
+            Prediction.player_id.in_(req.squad_player_ids),
+        )
+        .order_by(Prediction.predicted_points.asc(), Player.id.asc())
+    )
+
+    outgoing_results = db.execute(outgoing_stmt).all()
+
+    outgoing_candidates = []
+    for pred, pl, tm in outgoing_results:
+        outgoing_candidates.append({
+            "player_id": pl.id,
+            "web_name": pl.web_name,
+            "position": pl.position,
+            "team_id": tm.id,
+            "team_name": tm.name,
+            "team_short_name": tm.short_name,
+            "now_cost": pl.now_cost,
+            "predicted_points": float(pred.predicted_points or 0.0),
+            "status": pl.status,
+        })
+
+    if not outgoing_candidates:
+        return {
+            "target_gw": req.target_gw,
+            "model_name": req.model_name,
+            "bank": req.bank,
+            "free_transfers": req.free_transfers,
+            "allow_points_hit": req.allow_points_hit,
+            "squad_player_ids": req.squad_player_ids,
+            "limit": req.limit,
+            "selected_outgoing": None,
+            "outgoing_candidates": [],
+            "rows": [],
+            "note": "No outgoing squad players found for this target_gw + model_name."
+        }
+
+    # 2) MVP: only compare against the single lowest-predicted outgoing player
+    out = outgoing_candidates[0]
+    max_in_cost = out["now_cost"] + req.bank
+
+    incoming_stmt = (
+        select(Prediction, Player, Team)
+        .join(Player, Player.id == Prediction.player_id)
+        .join(Team, Team.id == Player.team_id)
+        .where(
+            Prediction.target_gw == req.target_gw,
+            Prediction.model_name == req.model_name,
+            Player.position == out["position"],
+            Player.status == "a",
+            ~Prediction.player_id.in_(req.squad_player_ids),
+            Player.now_cost <= max_in_cost,
+        )
+        .order_by(Prediction.predicted_points.desc(), Player.id.asc())
+        .limit(req.limit)
+    )
+
+    incoming_results = db.execute(incoming_stmt).all()
+
+    rows = []
+    for pred, pl, tm in incoming_results:
+        in_pred = float(pred.predicted_points or 0.0)
+        out_pred = float(out["predicted_points"])
+        gain = in_pred - out_pred
+
+        uses_bank = pl.now_cost > out["now_cost"]
+        has_free_transfer = req.free_transfers >= 1
+
+        if has_free_transfer:
+            transfer_cost_points = 0
+        else:
+            transfer_cost_points = 4
+
+        is_actionable_now = True
+        net_gain_after_cost = gain - transfer_cost_points
+
+        risk_flags = []
+        if uses_bank:
+            risk_flags.append("uses_bank")
+        if not has_free_transfer:
+            risk_flags.append("costs_minus_4")
+
+        rows.append({
+            "out_player_id": out["player_id"],
+            "out_web_name": out["web_name"],
+            "out_position": out["position"],
+            "out_team_name": out["team_name"],
+            "out_now_cost": out["now_cost"],
+            "out_predicted_points": out_pred,
+
+            "in_player_id": pl.id,
+            "in_web_name": pl.web_name,
+            "in_team_name": tm.name,
+            "in_team_short_name": tm.short_name,
+            "in_position": pl.position,
+            "in_now_cost": pl.now_cost,
+            "in_predicted_points": in_pred,
+
+            "projected_gain": gain,
+            "is_actionable_now": is_actionable_now,
+            "transfer_cost_points": transfer_cost_points,
+            "net_gain_after_cost": net_gain_after_cost,
+            "why_recommended": "Higher predicted points within budget and same position.",
+            "risk_flags": risk_flags,
+        })
+    rows = sorted(
+        rows,
+        key=lambda r: (
+            r["is_actionable_now"],
+            r["net_gain_after_cost"] if r["net_gain_after_cost"] is not None else float("-inf"),
+            r["projected_gain"],
+        ),
+        reverse=True,
+    )
+
+    return {
+        "target_gw": req.target_gw,
+        "model_name": req.model_name,
+        "bank": req.bank,
+        "free_transfers": req.free_transfers,
+        "allow_points_hit": req.allow_points_hit,
+        "squad_player_ids": req.squad_player_ids,
+        "limit": req.limit,
+        "selected_outgoing": out,
+        "outgoing_candidates": outgoing_candidates,
+        "rows": rows,
+    }
