@@ -234,6 +234,170 @@ def _can_complete_squad(
     return min_possible <= remaining_budget_m + 1e-9
 
 
+
+class TransferRecommendationsRequest(BaseModel):
+    target_gw: int
+    model_name: str
+    squad_player_ids: List[int]
+    bank: int = Field(default=0, ge=0)
+    free_transfers: int = Field(default=1, ge=0)
+    limit: int = Field(default=3, ge=1, le=10)
+
+
+def _build_squad_team_counts(rows: List[dict]) -> Dict[int, int]:
+    counts: Dict[int, int] = {}
+    for row in rows:
+        team_id = int(row["team_id"])
+        counts[team_id] = counts.get(team_id, 0) + 1
+    return counts
+
+
+def _build_squad_position_counts(rows: List[dict]) -> Dict[str, int]:
+    counts: Dict[str, int] = {"GKP": 0, "DEF": 0, "MID": 0, "FWD": 0}
+    for row in rows:
+        pos = str(row["position"])
+        if pos in counts:
+            counts[pos] += 1
+    return counts
+
+
+def _passes_budget_cap(*, outgoing_now_cost: int, incoming_now_cost: int, bank: int) -> bool:
+    return incoming_now_cost <= outgoing_now_cost + bank
+
+
+def _passes_position_compatibility(*, outgoing_position: str, incoming_position: str) -> bool:
+    return outgoing_position == incoming_position
+
+
+def _passes_availability_filter(*, incoming_status: str, require_available: bool = True) -> bool:
+    if not require_available:
+        return True
+    return incoming_status == "a"
+
+
+def _passes_team_cap(*, squad_team_counts: Dict[int, int], outgoing_team_id: int, incoming_team_id: int, max_per_team: int = 3) -> bool:
+    current_in_team_count = squad_team_counts.get(incoming_team_id, 0)
+    if incoming_team_id == outgoing_team_id:
+        resulting_team_count = current_in_team_count
+    else:
+        resulting_team_count = current_in_team_count + 1
+    return resulting_team_count <= max_per_team
+
+
+def _passes_squad_size_rules(*, squad_position_counts: Dict[str, int], outgoing_position: str, incoming_position: str) -> bool:
+    new_counts = dict(squad_position_counts)
+    if outgoing_position not in new_counts or incoming_position not in new_counts:
+        return False
+    new_counts[outgoing_position] -= 1
+    if new_counts[outgoing_position] < 0:
+        return False
+    new_counts[incoming_position] += 1
+    return new_counts == squad_position_counts
+
+
+def _validate_transfer_candidate(
+    *,
+    incoming_player: Player,
+    incoming_team: Team,
+    outgoing_position: str,
+    outgoing_team_id: int,
+    outgoing_now_cost: int,
+    squad_player_ids: set[int],
+    squad_team_counts: Dict[int, int],
+    squad_position_counts: Dict[str, int],
+    bank: int,
+    require_available: bool = True,
+    max_per_team: int = 3,
+) -> Tuple[bool, Optional[str]]:
+    if incoming_player.id in squad_player_ids:
+        return False, "already_in_squad"
+
+    if not _passes_position_compatibility(
+        outgoing_position=outgoing_position,
+        incoming_position=incoming_player.position,
+    ):
+        return False, "position_mismatch"
+
+    if not _passes_availability_filter(
+        incoming_status=incoming_player.status,
+        require_available=require_available,
+    ):
+        return False, "incoming_not_available"
+
+    if not _passes_budget_cap(
+        outgoing_now_cost=outgoing_now_cost,
+        incoming_now_cost=int(incoming_player.now_cost),
+        bank=bank,
+    ):
+        return False, "over_budget"
+
+    if not _passes_team_cap(
+        squad_team_counts=squad_team_counts,
+        outgoing_team_id=outgoing_team_id,
+        incoming_team_id=int(incoming_team.id),
+        max_per_team=max_per_team,
+    ):
+        return False, "team_cap_exceeded"
+
+    if not _passes_squad_size_rules(
+        squad_position_counts=squad_position_counts,
+        outgoing_position=outgoing_position,
+        incoming_position=incoming_player.position,
+    ):
+        return False, "invalid_squad_transition"
+
+    return True, None
+
+
+def _serialize_outgoing_candidate(pred: Prediction, pl: Player, tm: Team) -> dict:
+    return {
+        "player_id": pl.id,
+        "web_name": pl.web_name,
+        "position": pl.position,
+        "team_id": tm.id,
+        "team_name": tm.name,
+        "team_short_name": tm.short_name,
+        "now_cost": pl.now_cost,
+        "predicted_points": float(pred.predicted_points or 0.0),
+        "status": pl.status,
+    }
+
+
+def _rank_outgoing_candidates(rows: List[dict]) -> List[dict]:
+    return sorted(
+        rows,
+        key=lambda r: (
+            r["predicted_points"],
+            -r["now_cost"],
+            r["player_id"],
+        ),
+    )
+
+
+def _run_transfer_constraint_unit_checks() -> None:
+    # budget cap
+    assert _passes_budget_cap(outgoing_now_cost=60, incoming_now_cost=70, bank=10) is True
+    assert _passes_budget_cap(outgoing_now_cost=60, incoming_now_cost=71, bank=10) is False
+
+    # max 3 players per club
+    assert _passes_team_cap(squad_team_counts={5: 2}, outgoing_team_id=3, incoming_team_id=5, max_per_team=3) is True
+    assert _passes_team_cap(squad_team_counts={5: 3}, outgoing_team_id=3, incoming_team_id=5, max_per_team=3) is False
+    assert _passes_team_cap(squad_team_counts={3: 3}, outgoing_team_id=3, incoming_team_id=3, max_per_team=3) is True
+
+    # position compatibility
+    assert _passes_position_compatibility(outgoing_position="MID", incoming_position="MID") is True
+    assert _passes_position_compatibility(outgoing_position="MID", incoming_position="FWD") is False
+
+    # availability filtering
+    assert _passes_availability_filter(incoming_status="a", require_available=True) is True
+    assert _passes_availability_filter(incoming_status="d", require_available=True) is False
+    assert _passes_availability_filter(incoming_status="d", require_available=False) is True
+
+    # squad transitions
+    counts = {"GKP": 2, "DEF": 5, "MID": 5, "FWD": 3}
+    assert _passes_squad_size_rules(squad_position_counts=counts, outgoing_position="MID", incoming_position="MID") is True
+    assert _passes_squad_size_rules(squad_position_counts=counts, outgoing_position="MID", incoming_position="FWD") is False
+
 # -----------------------------
 # Helpers: picking logic
 # -----------------------------
@@ -743,14 +907,11 @@ def recommend_squad(
         "squad_list": squad_list,   # 15 flat
     }
 
-class TransferRecommendationsRequest(BaseModel):
-    target_gw: int
-    model_name: str
-    squad_player_ids: List[int]
-    bank: int = Field(default=0, ge=0)
-    free_transfers: int = Field(default=1, ge=0)
-    limit: int = Field(default=10, ge=1, le=50)
-    allow_points_hit: bool = False
+
+@router.get("/transfers/self-test")
+def transfer_constraint_self_test():
+    _run_transfer_constraint_unit_checks()
+    return {"ok": True}
 
 
 @router.post("/transfers")
@@ -758,7 +919,6 @@ def recommend_transfers(
     req: TransferRecommendationsRequest,
     db: Session = Depends(get_db),
 ):
-    # 1) Find current squad players with predictions for this GW/model
     outgoing_stmt = (
         select(Prediction, Player, Team)
         .join(Player, Player.id == Prediction.player_id)
@@ -772,20 +932,11 @@ def recommend_transfers(
     )
 
     outgoing_results = db.execute(outgoing_stmt).all()
-
-    outgoing_candidates = []
-    for pred, pl, tm in outgoing_results:
-        outgoing_candidates.append({
-            "player_id": pl.id,
-            "web_name": pl.web_name,
-            "position": pl.position,
-            "team_id": tm.id,
-            "team_name": tm.name,
-            "team_short_name": tm.short_name,
-            "now_cost": pl.now_cost,
-            "predicted_points": float(pred.predicted_points or 0.0),
-            "status": pl.status,
-        })
+    outgoing_candidates = [
+        _serialize_outgoing_candidate(pred, pl, tm)
+        for pred, pl, tm in outgoing_results
+    ]
+    outgoing_candidates = _rank_outgoing_candidates(outgoing_candidates)
 
     if not outgoing_candidates:
         return {
@@ -793,18 +944,17 @@ def recommend_transfers(
             "model_name": req.model_name,
             "bank": req.bank,
             "free_transfers": req.free_transfers,
-            "allow_points_hit": req.allow_points_hit,
             "squad_player_ids": req.squad_player_ids,
             "limit": req.limit,
             "selected_outgoing": None,
             "outgoing_candidates": [],
             "rows": [],
-            "note": "No outgoing squad players found for this target_gw + model_name."
         }
 
-    # 2) MVP: only compare against the single lowest-predicted outgoing player
     out = outgoing_candidates[0]
-    max_in_cost = out["now_cost"] + req.bank
+    squad_team_counts = _build_squad_team_counts(outgoing_candidates)
+    squad_position_counts = _build_squad_position_counts(outgoing_candidates)
+    squad_player_ids_set = set(req.squad_player_ids)
 
     incoming_stmt = (
         select(Prediction, Player, Team)
@@ -813,38 +963,40 @@ def recommend_transfers(
         .where(
             Prediction.target_gw == req.target_gw,
             Prediction.model_name == req.model_name,
-            Player.position == out["position"],
-            Player.status == "a",
-            ~Prediction.player_id.in_(req.squad_player_ids),
-            Player.now_cost <= max_in_cost,
         )
         .order_by(Prediction.predicted_points.desc(), Player.id.asc())
-        .limit(req.limit)
     )
 
     incoming_results = db.execute(incoming_stmt).all()
 
     rows = []
     for pred, pl, tm in incoming_results:
+        allowed, _ = _validate_transfer_candidate(
+            incoming_player=pl,
+            incoming_team=tm,
+            outgoing_position=out["position"],
+            outgoing_team_id=out["team_id"],
+            outgoing_now_cost=out["now_cost"],
+            squad_player_ids=squad_player_ids_set,
+            squad_team_counts=squad_team_counts,
+            squad_position_counts=squad_position_counts,
+            bank=req.bank,
+            require_available=True,
+            max_per_team=3,
+        )
+        if not allowed:
+            continue
+
         in_pred = float(pred.predicted_points or 0.0)
         out_pred = float(out["predicted_points"])
         gain = in_pred - out_pred
-
-        uses_bank = pl.now_cost > out["now_cost"]
-        has_free_transfer = req.free_transfers >= 1
-
-        if has_free_transfer:
-            transfer_cost_points = 0
-        else:
-            transfer_cost_points = 4
-
-        is_actionable_now = True
+        transfer_cost_points = 0 if req.free_transfers >= 1 else 4
         net_gain_after_cost = gain - transfer_cost_points
 
         risk_flags = []
-        if uses_bank:
+        if pl.now_cost > out["now_cost"]:
             risk_flags.append("uses_bank")
-        if not has_free_transfer:
+        if transfer_cost_points == 4:
             risk_flags.append("costs_minus_4")
 
         rows.append({
@@ -854,7 +1006,6 @@ def recommend_transfers(
             "out_team_name": out["team_name"],
             "out_now_cost": out["now_cost"],
             "out_predicted_points": out_pred,
-
             "in_player_id": pl.id,
             "in_web_name": pl.web_name,
             "in_team_name": tm.name,
@@ -862,33 +1013,29 @@ def recommend_transfers(
             "in_position": pl.position,
             "in_now_cost": pl.now_cost,
             "in_predicted_points": in_pred,
-
             "projected_gain": gain,
-            "is_actionable_now": is_actionable_now,
+            "is_actionable_now": True,
             "transfer_cost_points": transfer_cost_points,
             "net_gain_after_cost": net_gain_after_cost,
             "why_recommended": "Higher predicted points within budget and same position.",
             "risk_flags": risk_flags,
         })
+
     rows = sorted(
         rows,
-        key=lambda r: (
-            r["is_actionable_now"],
-            r["net_gain_after_cost"] if r["net_gain_after_cost"] is not None else float("-inf"),
-            r["projected_gain"],
-        ),
+        key=lambda r: (r["net_gain_after_cost"], r["projected_gain"]),
         reverse=True,
-    )
+    )[: req.limit]
 
     return {
         "target_gw": req.target_gw,
         "model_name": req.model_name,
         "bank": req.bank,
         "free_transfers": req.free_transfers,
-        "allow_points_hit": req.allow_points_hit,
         "squad_player_ids": req.squad_player_ids,
         "limit": req.limit,
         "selected_outgoing": out,
         "outgoing_candidates": outgoing_candidates,
+        "squad_team_counts": squad_team_counts,
         "rows": rows,
     }
