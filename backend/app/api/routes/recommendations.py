@@ -15,6 +15,7 @@ from app.models.prediction import Prediction
 from app.models.player import Player
 from app.models.team import Team
 from app.models.gameweek import Gameweek
+from app.models.player_gw_stat import PlayerGameweekStat
 
 router = APIRouter(prefix="/recommendations", tags=["recommendations"])
 
@@ -629,6 +630,93 @@ def _group_by_position(rows: List[Tuple[Prediction, Player, Team]]) -> Dict[Posi
             out[pl.position].append((pred, pl, tm))
     return out
 
+def _get_recent_player_stats(
+    *,
+    db: Session,
+    player_id: int,
+    target_gw: int,
+    window: int = 5,
+) -> List[PlayerGameweekStat]:
+    stmt = (
+        select(PlayerGameweekStat)
+        .where(
+            PlayerGameweekStat.player_id == player_id,
+            PlayerGameweekStat.gw < target_gw,
+        )
+        .order_by(PlayerGameweekStat.gw.desc())
+        .limit(window)
+    )
+    return list(db.execute(stmt).scalars().all())
+
+
+def _build_recent_form_summary(stats: List[PlayerGameweekStat]) -> str:
+    if not stats:
+        return "No recent stats available."
+
+    avg_points = sum(float(s.total_points or 0.0) for s in stats) / len(stats)
+    return f"Last {len(stats)} GWs: avg {avg_points:.2f} pts"
+
+
+def _build_minutes_stability(stats: List[PlayerGameweekStat]) -> dict:
+    if not stats:
+        return {
+            "label": "unknown",
+            "avg_minutes": None,
+            "mins_60_plus_count": 0,
+            "sample_size": 0,
+        }
+
+    minutes = [int(s.minutes or 0) for s in stats]
+    avg_minutes = sum(minutes) / len(minutes)
+    mins_60_plus_count = sum(1 for m in minutes if m >= 60)
+
+    if avg_minutes >= 75 and mins_60_plus_count >= max(3, len(minutes) - 1):
+        label = "high"
+    elif avg_minutes >= 45:
+        label = "medium"
+    else:
+        label = "low"
+
+    return {
+        "label": label,
+        "avg_minutes": round(avg_minutes, 1),
+        "mins_60_plus_count": mins_60_plus_count,
+        "sample_size": len(stats),
+    }
+
+def _captain_label_from_predicted_points(predicted_points: float) -> str:
+    if predicted_points >= 7.0:
+        return "safe"
+    if predicted_points >= 5.5:
+        return "balanced"
+    return "upside"
+
+def _captain_label_from_signals(
+    predicted_points: float,
+    minutes_stability: dict,
+    recent_form_summary: str,
+) -> str:
+    minutes_label = minutes_stability.get("label")
+    avg_recent_points = 0.0
+
+    # parse "Last 5 GWs: avg 6.20 pts"
+    try:
+        parts = recent_form_summary.split("avg ")
+        if len(parts) > 1:
+            avg_recent_points = float(parts[1].split(" pts")[0])
+    except Exception:
+        avg_recent_points = 0.0
+
+    # safe = high prediction + stable minutes + decent recent form
+    if (
+        predicted_points >= 7.5
+        and minutes_label == "high"
+        and avg_recent_points >= 5.0
+    ):
+        return "safe"
+
+    # otherwise treat as upside
+    return "upside"
 
 # -----------------------------
 # Endpoint: /recommendations/squad
@@ -1038,4 +1126,76 @@ def recommend_transfers(
         "outgoing_candidates": outgoing_candidates,
         "squad_team_counts": squad_team_counts,
         "rows": rows,
+    }
+
+@router.get("/captain")
+def recommend_captain(
+    target_gw: int,
+    model_name: str = Query(default=MODEL_NAME),
+    limit: int = Query(default=5, ge=2, le=10),
+    db: Session = Depends(get_db),
+):
+    stmt = (
+        select(Prediction, Player, Team)
+        .join(Player, Player.id == Prediction.player_id)
+        .join(Team, Team.id == Player.team_id)
+        .where(
+            Prediction.target_gw == target_gw,
+            Prediction.model_name == model_name,
+            Player.status == "a",
+        )
+        .order_by(Prediction.predicted_points.desc(), Player.id.asc())
+        .limit(limit)
+    )
+
+    results = db.execute(stmt).all()
+
+    top_candidates = []
+    for pred, pl, tm in results:
+        pts = float(pred.predicted_points or 0.0)
+
+        recent_stats = _get_recent_player_stats(
+            db=db,
+            player_id=pl.id,
+            target_gw=target_gw,
+            window=5,
+        )
+        recent_form_summary = _build_recent_form_summary(recent_stats)
+        minutes_stability = _build_minutes_stability(recent_stats)
+        captain_label = _captain_label_from_signals(
+            pts,
+            minutes_stability,
+            recent_form_summary,
+        )
+
+        top_candidates.append({
+            "player_id": pl.id,
+            "web_name": pl.web_name,
+            "team_name": tm.name,
+            "team_short_name": tm.short_name,
+            "position": pl.position,
+            "now_cost": pl.now_cost,
+            "predicted_points": pts,
+            "captain_label": captain_label,
+            "recent_form_summary": recent_form_summary,
+            "minutes_stability": minutes_stability,
+            "explanation": f"Predicted {pts:.2f} points; {recent_form_summary}; minutes stability {minutes_stability['label']}; profile {captain_label}.",
+            "future_factors": {
+                "fixture_difficulty": None,
+                "opponent_defense_strength": None,
+                "home_away": None,
+                "fixture_count": None,
+                "match_model_signal": None,
+            },
+        })
+
+    captain = top_candidates[0] if len(top_candidates) >= 1 else None
+    vice_captain = top_candidates[1] if len(top_candidates) >= 2 else None
+
+    return {
+        "target_gw": target_gw,
+        "model_name": model_name,
+        "captain": captain,
+        "vice_captain": vice_captain,
+        "top_candidates": top_candidates,
     }
