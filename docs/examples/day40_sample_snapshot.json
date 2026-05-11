@@ -1,0 +1,30 @@
+{
+  "squad_player_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14,
+    15
+  ],
+  "captain_player_id": 1,
+  "vice_captain_player_id": 2,
+  "bench_order_player_ids": [
+    12,
+    13,
+    14,
+    15
+  ],
+  "bank": 10,
+  "target_gw": 32,
+  "model_name": "baseline_rollavg_v0"
+}
