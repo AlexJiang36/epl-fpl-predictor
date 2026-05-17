@@ -4,6 +4,28 @@ from typing import List, Optional
 from pydantic import BaseModel, Field
 
 
+class FreeHitPlayer(BaseModel):
+    player_id: int
+    web_name: str
+    team_name: str
+    team_short_name: str
+    position: str
+    now_cost: int
+    predicted_points: float
+    status: str
+
+
+class FreeHitRejectedCandidate(BaseModel):
+    player_id: int
+    web_name: str
+    team_name: str
+    team_short_name: str
+    position: str
+    now_cost: int
+    predicted_points: float
+    rejected_reason: str
+
+
 class FreeHitBuildRequest(BaseModel):
     target_gw: int = Field(ge=1)
     budget: float = Field(ge=0)
@@ -19,8 +41,17 @@ class FreeHitBuildResponse(BaseModel):
 
     scoring_objective: str
 
-    candidate_pool_counts: dict
-    locked_player_count: int
-    locked_position_counts: dict
-    constraint_helpers_to_apply: List[str]
+    starting_xi: List[FreeHitPlayer]
+    bench: List[FreeHitPlayer]
+    captain: Optional[FreeHitPlayer] = None
+    vice_captain: Optional[FreeHitPlayer] = None
+    
+
+    spent_m: float
+    remaining_m: float
+    projected_points_starting_xi: float
+    projected_points_total_15: float
+
+    rejected_candidates: List[FreeHitRejectedCandidate] = Field(default_factory=list)
+
     notes: Optional[str] = None
