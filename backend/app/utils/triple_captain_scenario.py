@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy import select, func as sa_func
 from sqlalchemy.orm import Session
+from typing import Optional
 
 from app.models.prediction import Prediction
 from app.schemas.squad_snapshot import SquadSnapshot
@@ -54,7 +55,7 @@ def run_triple_captain_scenario(
     *,
     db: Session,
     snapshot: SquadSnapshot,
-    notes: str | None = None,
+    notes: Optional[str] = None,
 ) -> ChipScenarioResult:
     bench_ids = set(snapshot.bench_order_player_ids)
     starting_xi_ids = [

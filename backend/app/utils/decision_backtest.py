@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from sqlalchemy import select, func as sa_func
 from sqlalchemy.orm import Session
+from typing import Optional
 
 from app.models.prediction import Prediction
 from app.schemas.squad_snapshot import SquadSnapshot
@@ -31,7 +32,7 @@ def run_decision_backtest(
     db: Session,
     before: SquadSnapshot,
     after: SquadSnapshot,
-    notes: str | None = None,
+    notes: Optional[str] = None,
 ) -> DecisionBacktestResult:
     comparison = compare_squad_snapshots(before, after)
 

@@ -4,6 +4,7 @@ from typing import Dict, List
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
+from typing import Dict, List, Optional
 
 from app.models.prediction import Prediction
 from app.models.player import Player
@@ -66,7 +67,7 @@ def load_recent_minutes_by_player(
 
 def aggregate_player_horizon_features(
     rows,
-    recent_minutes_map: Dict[int, List[int]] | None = None,
+    recent_minutes_map: Optional[Dict[int, List[int]]] = None,
 ) -> List[Dict]:
     by_player: Dict[int, Dict] = {}
 

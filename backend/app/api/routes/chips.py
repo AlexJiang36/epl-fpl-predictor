@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from fastapi import APIRouter, Depends, HTTPException
 from sqlalchemy import select
@@ -92,7 +92,7 @@ def _min_cost_needed_for_remaining(
     team_counts: Dict[int, int],
     need_by_pos: Dict[str, int],
     max_per_team: int = 3,
-) -> int | None:
+) -> Optional[int]:
     total = 0
 
     for pos, need in need_by_pos.items():
@@ -231,7 +231,7 @@ def _build_starting_and_bench(
     return starting_xi, bench
 
 
-def _choose_captains(starting_xi: List[FreeHitPlayer]) -> tuple[FreeHitPlayer | None, FreeHitPlayer | None]:
+def _choose_captains(starting_xi: List[FreeHitPlayer]) -> Tuple[Optional[FreeHitPlayer], Optional[FreeHitPlayer]]:
     ordered = sorted(
         starting_xi,
         key=lambda x: (x.predicted_points, -x.now_cost, -x.player_id),
@@ -253,8 +253,8 @@ def _validate_free_hit_result(
     *,
     starting_xi: List[FreeHitPlayer],
     bench: List[FreeHitPlayer],
-    captain: FreeHitPlayer | None,
-    vice_captain: FreeHitPlayer | None,
+    captain: Optional[FreeHitPlayer],
+    vice_captain: Optional[FreeHitPlayer],
     locked_player_ids: List[int],
     budget: float,
     spent_m: float,

@@ -211,3 +211,6 @@ frontend/dist/
 
 # macOS
 .DS_Store
+backend/artifacts/
+docs/examples/day45_sample_output.json
+docs/wildcard_horizon_assumptions.md

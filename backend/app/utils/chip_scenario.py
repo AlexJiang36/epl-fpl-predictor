@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from app.schemas.chip_scenario import ChipScenarioResult
-
+from typing import Optional
 
 def evaluate_chip_scenario(
     *,
@@ -9,8 +9,8 @@ def evaluate_chip_scenario(
     baseline_projected_points: float,
     modified_projected_points: float,
     explanation: str,
-    details: dict | None = None,
-    notes: str | None = None,
+    details: Optional[dict] = None,
+    notes: Optional[str] = None,
 ) -> ChipScenarioResult:
     delta = modified_projected_points - baseline_projected_points
 
