@@ -167,6 +167,7 @@ def ingest_fpl_fixtures(db: Session = Depends(get_db)):
             continue
 
         kickoff_time = parse_dt(fx.get("kickoff_time"))
+        gw = int(fx["event"]) if fx.get("event") is not None else None
         finished = bool(fx.get("finished"))
 
         # scores can be None before match played
@@ -184,6 +185,7 @@ def ingest_fpl_fixtures(db: Session = Depends(get_db)):
                     home_team_id=home_team_id,
                     away_team_id=away_team_id,
                     kickoff_time=kickoff_time,
+                    gw=gw,
                     finished=finished,
                     home_score=home_score,
                     away_score=away_score,
@@ -194,17 +196,26 @@ def ingest_fpl_fixtures(db: Session = Depends(get_db)):
             changed = False
 
             if existing.home_team_id != home_team_id:
-                existing.home_team_id = home_team_id; changed = True
+                existing.home_team_id = home_team_id
+                changed = True
             if existing.away_team_id != away_team_id:
-                existing.away_team_id = away_team_id; changed = True
+                existing.away_team_id = away_team_id
+                changed = True
             if existing.kickoff_time != kickoff_time:
-                existing.kickoff_time = kickoff_time; changed = True
+                existing.kickoff_time = kickoff_time
+                changed = True
+            if existing.gw != gw:
+                existing.gw = gw
+                changed = True
             if existing.finished != finished:
-                existing.finished = finished; changed = True
+                existing.finished = finished
+                changed = True
             if existing.home_score != home_score:
-                existing.home_score = home_score; changed = True
+                existing.home_score = home_score
+                changed = True
             if existing.away_score != away_score:
-                existing.away_score = away_score; changed = True
+                existing.away_score = away_score
+                changed = True
 
             if changed:
                 updated += 1
