@@ -7,6 +7,7 @@ from app.core.db import get_db
 from app.models.fixture import Fixture
 from app.models.team import Team
 from app.models.match_prediction import MatchPrediction
+from app.utils.model_metadata_store import maybe_load_model_metadata_artifact
 
 router = APIRouter(prefix="/match/predictions", tags=["match"])
 
@@ -248,8 +249,41 @@ def list_match_models(db: Session = Depends(get_db)):
         .order_by(MatchPrediction.model_name.asc())
         .all()
     )
+
     model_names = [r[0] for r in rows if r and r[0]]
-    return {"models": model_names, "meta": {"count": len(model_names), "source": "match_predictions_distinct"}}
+
+    models = []
+    for name in model_names:
+        meta_artifact = maybe_load_model_metadata_artifact(name)
+
+        models.append(
+            {
+                "model_name": name,
+                "label": name,
+                "task_type": "match_result",
+                "source": "match_predictions_distinct",
+                "is_active": True,
+                "notes": None,
+                "metadata": {
+                    "feature_version": meta_artifact.feature_version if meta_artifact else None,
+                    "training_window_start_gw": meta_artifact.training_window_start_gw if meta_artifact else None,
+                    "training_window_end_gw": meta_artifact.training_window_end_gw if meta_artifact else None,
+                    "evaluation_start_gw": meta_artifact.evaluation_start_gw if meta_artifact else None,
+                    "evaluation_end_gw": meta_artifact.evaluation_end_gw if meta_artifact else None,
+                    "metrics_summary": meta_artifact.metrics_summary if meta_artifact else {},
+                    "notes": meta_artifact.notes if meta_artifact else None,
+                    "updated_at": meta_artifact.updated_at.isoformat() if meta_artifact else None,
+                },
+            }
+        )
+
+    return {
+        "models": models,
+        "meta": {
+            "count": len(models),
+            "source": "match_predictions_distinct",
+        },
+    }
 
 @router.post("/run_gw")
 def run_match_baseline_for_gw(
