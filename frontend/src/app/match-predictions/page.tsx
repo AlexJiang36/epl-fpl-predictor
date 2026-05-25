@@ -15,16 +15,34 @@ type Row = {
   found: boolean;
 };
 
+type MatchModel = {
+  model_name: string;
+  label?: string;
+  task_type?: string;
+  source?: string;
+  is_active?: boolean;
+  notes?: string | null;
+  metadata?: {
+    feature_version?: string | null;
+    training_window_start_gw?: number | null;
+    training_window_end_gw?: number | null;
+    evaluation_start_gw?: number | null;
+    evaluation_end_gw?: number | null;
+    metrics_summary?: Record<string, number>;
+    notes?: string | null;
+    updated_at?: string | null;
+  };
+};
+
 type ModelsResponse = {
-  models?: string[];
+  models?: MatchModel[];
   meta?: any;
 };
 
 export default function MatchPredictionsPage() {
   const [gw, setGw] = useState<number>(30);
 
-  // dropdown models
-  const [models, setModels] = useState<string[]>([]);
+  const [models, setModels] = useState<MatchModel[]>([]);
   const [modelName, setModelName] = useState<string>("match_baseline_v0");
 
   const [rows, setRows] = useState<Row[]>([]);
@@ -48,14 +66,13 @@ export default function MatchPredictionsPage() {
         if (!cancelled) {
           setModels(list);
 
-          // If current model isn't in the list, default to first available.
-          if (list.length > 0 && !list.includes(modelName)) {
-            setModelName(list[0]);
+          const modelNames = list.map((m) => m.model_name);
+          if (list.length > 0 && !modelNames.includes(modelName)) {
+            setModelName(list[0].model_name);
           }
         }
       } catch (e) {
         if (!cancelled) {
-          // Keep existing modelName; allow manual fetch even if models endpoint fails.
           setModels([]);
         }
       } finally {
@@ -67,7 +84,6 @@ export default function MatchPredictionsPage() {
     return () => {
       cancelled = true;
     };
-    // intentionally run once on mount
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
@@ -128,8 +144,8 @@ export default function MatchPredictionsPage() {
                 </option>
               ) : (
                 models.map((m) => (
-                  <option key={m} value={m}>
-                    {m}
+                  <option key={m.model_name} value={m.model_name}>
+                    {m.label ?? m.model_name}
                   </option>
                 ))
               )}

@@ -23,6 +23,11 @@ def parse_args() -> argparse.Namespace:
         default="",
         help="Optional path to save JSON report, e.g. docs/examples/day48_refresh_check_report.json",
     )
+    parser.add_argument(
+        "--skip-prediction-count-check",
+        action="store_true",
+        help="Skip the target_gw/model prediction count check.",
+    )
     return parser.parse_args()
 
 
@@ -39,7 +44,11 @@ def run_scalar_int(db, sql: str, params: Dict[str, Any] = None) -> int:
     return int(value or 0)
 
 
-def run_checks(target_gw: int, model_name: str) -> Dict[str, Any]:
+def run_checks(
+    target_gw: int,
+    model_name: str,
+    require_prediction_count_check: bool = True,
+) -> Dict[str, Any]:
     db = SessionLocal()
     try:
         checks: List[Dict[str, Any]] = []
@@ -136,27 +145,42 @@ def run_checks(target_gw: int, model_name: str) -> Dict[str, Any]:
         )
 
         # 4) prediction counts present for target GW / model
-        prediction_count_for_target = run_scalar_int(
-            db,
-            """
-            SELECT COUNT(*)
-            FROM predictions
-            WHERE target_gw = :target_gw
-              AND model_name = :model_name
-            """,
-            {"target_gw": target_gw, "model_name": model_name},
-        )
-        checks.append(
-            make_check(
-                name="prediction_counts_present_for_target_gw_model",
-                passed=(prediction_count_for_target > 0),
-                details={
-                    "target_gw": target_gw,
-                    "model_name": model_name,
-                    "prediction_row_count": prediction_count_for_target,
-                },
+        if require_prediction_count_check:
+            prediction_count_for_target = run_scalar_int(
+                db,
+                """
+                SELECT COUNT(*)
+                FROM predictions
+                WHERE target_gw = :target_gw
+                  AND model_name = :model_name
+                """,
+                {"target_gw": target_gw, "model_name": model_name},
             )
-        )
+            checks.append(
+                make_check(
+                    name="prediction_counts_present_for_target_gw_model",
+                    passed=(prediction_count_for_target > 0),
+                    details={
+                        "target_gw": target_gw,
+                        "model_name": model_name,
+                        "prediction_row_count": prediction_count_for_target,
+                    },
+                )
+            )
+        else:
+            checks.append(
+                make_check(
+                    name="prediction_counts_present_for_target_gw_model",
+                    passed=True,
+                    details={
+                        "target_gw": target_gw,
+                        "model_name": model_name,
+                        "prediction_row_count": None,
+                        "skipped": True,
+                        "reason": "pre-refresh validation phase",
+                    },
+                )
+            )
 
         overall_passed = all(c["passed"] for c in checks)
 
@@ -201,6 +225,7 @@ def main() -> None:
     report = run_checks(
         target_gw=args.target_gw,
         model_name=args.model_name,
+        require_prediction_count_check=not args.skip_prediction_count_check,
     )
     print_summary(report)
     maybe_save_report(report, args.out)
