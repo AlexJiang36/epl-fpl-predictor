@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import subprocess
 from pathlib import Path
 
@@ -33,10 +34,21 @@ def main() -> None:
     out_csv = Path(args.out_csv)
     out_csv.parent.mkdir(parents=True, exist_ok=True)
 
+    if args.feature_version == "v0":
+        module_name = "ml.features.export_features_v0"
+        source_tables = ["player_gw_stats", "players"]
+        notes = "Offline player feature snapshot export (v0)."
+    elif args.feature_version == "v2":
+        module_name = "ml.features.export_features_v2"
+        source_tables = ["player_gw_stats", "players", "fixtures"]
+        notes = "Offline player feature snapshot export (v2)."
+    else:
+        raise RuntimeError(f"Unsupported feature version: {args.feature_version}")
+
     export_cmd = [
         "python",
         "-m",
-        "ml.features.export_features_v0",
+        module_name,
         "--start_gw",
         str(args.gw_start),
         "--end_gw",
@@ -45,12 +57,12 @@ def main() -> None:
         str(out_csv),
     ]
 
-    subprocess.run(export_cmd, check=True)
+    child_env = os.environ.copy()
+    subprocess.run(export_cmd, check=True, env=child_env)
 
     row_count = 0
     if out_csv.exists():
         with out_csv.open("r", encoding="utf-8") as f:
-            # subtract header
             row_count = max(sum(1 for _ in f) - 1, 0)
 
     artifact = create_feature_snapshot_artifact(
@@ -59,10 +71,10 @@ def main() -> None:
         gw_start=args.gw_start,
         gw_end=args.gw_end,
         output_path=str(out_csv),
-        source_tables=["player_gw_stats", "fixtures", "players", "teams"],
+        source_tables=source_tables,
         model_name=args.model_name,
         row_count=row_count,
-        notes="Offline player feature snapshot export",
+        notes=notes,
     )
 
     meta_path = save_feature_snapshot_artifact(artifact)
