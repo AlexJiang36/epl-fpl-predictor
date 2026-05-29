@@ -23,7 +23,7 @@ def parse_args() -> argparse.Namespace:
         "--out-csv",
         type=str,
         required=True,
-        help="Output CSV path, e.g. artifacts/offline_datasets/player_features_gw1_27_v0.csv",
+        help="Output CSV path, e.g. artifacts/offline_datasets/player_features_gw1_27_v2.csv",
     )
     return parser.parse_args()
 
@@ -42,6 +42,10 @@ def main() -> None:
         module_name = "ml.features.export_features_v2"
         source_tables = ["player_gw_stats", "players", "fixtures"]
         notes = "Offline player feature snapshot export (v2)."
+    elif args.feature_version == "v2_1":
+        module_name = "ml.features.export_features_v2_1"
+        source_tables = ["player_gw_stats", "players", "fixtures"]
+        notes = "Offline player feature snapshot export (v2_1) with intrinsic / availability proxies."
     else:
         raise RuntimeError(f"Unsupported feature version: {args.feature_version}")
 
