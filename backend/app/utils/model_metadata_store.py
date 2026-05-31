@@ -7,52 +7,59 @@ from typing import List, Optional
 from app.schemas.model_metadata import ModelMetadataArtifact
 
 
-BASE_DIR = Path("artifacts/model_metadata")
+ARTIFACT_DIR = Path("artifacts/model_metadata")
 
 
-def _ensure_base_dir() -> Path:
-    BASE_DIR.mkdir(parents=True, exist_ok=True)
-    return BASE_DIR
+def _artifact_to_jsonable(artifact: ModelMetadataArtifact):
+    try:
+        return artifact.model_dump(mode="json")
+    except AttributeError:
+        return json.loads(artifact.json())
 
 
-def _artifact_path(model_name: str) -> Path:
-    safe_name = model_name.replace("/", "_")
-    return _ensure_base_dir() / f"{safe_name}.json"
+def _parse_artifact(data) -> ModelMetadataArtifact:
+    try:
+        return ModelMetadataArtifact.model_validate(data)
+    except AttributeError:
+        return ModelMetadataArtifact.parse_obj(data)
+
+
+def get_model_metadata_artifact_path(model_name: str) -> Path:
+    return ARTIFACT_DIR / f"{model_name}.json"
 
 
 def save_model_metadata_artifact(artifact: ModelMetadataArtifact) -> Path:
-    path = _artifact_path(artifact.model_name)
-    path.write_text(
-        json.dumps(artifact.model_dump(mode="json"), indent=2),
-        encoding="utf-8",
-    )
+    ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
+    path = get_model_metadata_artifact_path(artifact.model_name)
+    payload = _artifact_to_jsonable(artifact)
+    path.write_text(json.dumps(payload, indent=2), encoding="utf-8")
+    print(f"saved: {path}")
     return path
 
 
-def load_model_metadata_artifact(model_name: str) -> ModelMetadataArtifact:
-    path = _artifact_path(model_name)
-    if not path.exists():
-        raise FileNotFoundError(f"Model metadata not found: {model_name}")
-
-    data = json.loads(path.read_text(encoding="utf-8"))
-    return ModelMetadataArtifact(**data)
-
-
-def list_model_metadata_artifacts(limit: int = 50) -> List[ModelMetadataArtifact]:
-    base = _ensure_base_dir()
-    paths = sorted(base.glob("*.json"), key=lambda p: p.stat().st_mtime, reverse=True)
-
-    results: List[ModelMetadataArtifact] = []
-    for path in paths[:limit]:
-        data = json.loads(path.read_text(encoding="utf-8"))
-        results.append(ModelMetadataArtifact(**data))
-
-    return results
-
-
 def maybe_load_model_metadata_artifact(model_name: str) -> Optional[ModelMetadataArtifact]:
-    path = _artifact_path(model_name)
+    path = get_model_metadata_artifact_path(model_name)
     if not path.exists():
         return None
+
     data = json.loads(path.read_text(encoding="utf-8"))
-    return ModelMetadataArtifact(**data)
+    return _parse_artifact(data)
+
+
+def list_model_metadata_artifacts(task_type: Optional[str] = None) -> List[ModelMetadataArtifact]:
+    if not ARTIFACT_DIR.exists():
+        return []
+
+    out: List[ModelMetadataArtifact] = []
+    for path in sorted(ARTIFACT_DIR.glob("*.json")):
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+            artifact = _parse_artifact(data)
+        except Exception:
+            continue
+
+        if task_type and artifact.task_type != task_type:
+            continue
+        out.append(artifact)
+
+    return out

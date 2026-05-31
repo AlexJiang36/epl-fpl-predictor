@@ -7,7 +7,10 @@ from app.core.db import get_db
 from app.models.fixture import Fixture
 from app.models.team import Team
 from app.models.match_prediction import MatchPrediction
-from app.utils.model_metadata_store import maybe_load_model_metadata_artifact
+from app.utils.model_metadata_store import (
+    list_model_metadata_artifacts,
+    maybe_load_model_metadata_artifact,
+)
 
 router = APIRouter(prefix="/match/predictions", tags=["match"])
 
@@ -240,7 +243,10 @@ def list_match_predictions(
     return {"meta": {"gw": gw, "model_name": model_name, "count": len(rows)}, "rows": rows}
 
 @router.get("/models")
-def list_match_models(db: Session = Depends(get_db)):
+def list_match_models(
+    active_only: bool = Query(False),
+    db: Session = Depends(get_db),
+):
     rows = (
         db.query(MatchPrediction.model_name)
         .filter(MatchPrediction.model_name.isnot(None))
@@ -250,38 +256,53 @@ def list_match_models(db: Session = Depends(get_db)):
         .all()
     )
 
-    model_names = [r[0] for r in rows if r and r[0]]
+    names_from_predictions = {r[0] for r in rows if r and r[0]}
+    metadata_models = list_model_metadata_artifacts(task_type="match_result")
+    names_from_metadata = {m.model_name for m in metadata_models}
+
+    all_names = sorted(names_from_predictions | names_from_metadata)
 
     models = []
-    for name in model_names:
+    for name in all_names:
         meta_artifact = maybe_load_model_metadata_artifact(name)
+        source = "match_predictions_distinct" if name in names_from_predictions else "model_metadata"
 
-        models.append(
-            {
-                "model_name": name,
-                "label": name,
-                "task_type": "match_result",
-                "source": "match_predictions_distinct",
-                "is_active": True,
-                "notes": None,
-                "metadata": {
-                    "feature_version": meta_artifact.feature_version if meta_artifact else None,
-                    "training_window_start_gw": meta_artifact.training_window_start_gw if meta_artifact else None,
-                    "training_window_end_gw": meta_artifact.training_window_end_gw if meta_artifact else None,
-                    "evaluation_start_gw": meta_artifact.evaluation_start_gw if meta_artifact else None,
-                    "evaluation_end_gw": meta_artifact.evaluation_end_gw if meta_artifact else None,
-                    "metrics_summary": meta_artifact.metrics_summary if meta_artifact else {},
-                    "notes": meta_artifact.notes if meta_artifact else None,
-                    "updated_at": meta_artifact.updated_at.isoformat() if meta_artifact else None,
-                },
-            }
-        )
+        row = {
+            "model_name": name,
+            "label": name,
+            "task_type": meta_artifact.task_type if meta_artifact else "match_result",
+            "source": source,
+            "status": meta_artifact.status if meta_artifact else "experimental",
+            "is_active": meta_artifact.is_active if meta_artifact else False,
+            "is_production_default": meta_artifact.is_production_default if meta_artifact else False,
+            "selected_reason": meta_artifact.selected_reason if meta_artifact else None,
+            "notes": meta_artifact.notes if meta_artifact else None,
+            "metadata": {
+                "feature_version": meta_artifact.feature_version if meta_artifact else None,
+                "training_window_start_gw": meta_artifact.training_window_start_gw if meta_artifact else None,
+                "training_window_end_gw": meta_artifact.training_window_end_gw if meta_artifact else None,
+                "evaluation_start_gw": meta_artifact.evaluation_start_gw if meta_artifact else None,
+                "evaluation_end_gw": meta_artifact.evaluation_end_gw if meta_artifact else None,
+                "metrics_summary": meta_artifact.metrics_summary if meta_artifact else {},
+                "status": meta_artifact.status if meta_artifact else "experimental",
+                "is_active": meta_artifact.is_active if meta_artifact else False,
+                "is_production_default": meta_artifact.is_production_default if meta_artifact else False,
+                "selected_reason": meta_artifact.selected_reason if meta_artifact else None,
+                "notes": meta_artifact.notes if meta_artifact else None,
+                "updated_at": meta_artifact.updated_at.isoformat() if meta_artifact else None,
+            },
+        }
+
+        if active_only and not row["is_active"]:
+            continue
+        models.append(row)
 
     return {
         "models": models,
         "meta": {
             "count": len(models),
-            "source": "match_predictions_distinct",
+            "source": "match_predictions_distinct_plus_model_metadata",
+            "active_only": active_only,
         },
     }
 
