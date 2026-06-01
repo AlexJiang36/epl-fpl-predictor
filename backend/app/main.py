@@ -1,4 +1,5 @@
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from app.api.routes.health import router as health_router
 from app.api.routes.db_ping import router as db_ping_router
 from app.api.routes.teams import router as teams_router
@@ -16,9 +17,22 @@ from app.api.routes.match_predictions import router as match_predictions_router
 from app.api.routes.team_form import router as team_form_router
 from app.api.routes import chips
 from app.api.routes import decision_runs
+from app.api.routes import evaluation
+
 
 
 app = FastAPI(title="EPL/FPL Predictor")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=[
+        "http://localhost:3000",
+        "http://127.0.0.1:3000",
+    ],
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 app.include_router(health_router)
 app.include_router(db_ping_router)
@@ -37,3 +51,4 @@ app.include_router(match_predictions_router)
 app.include_router(team_form_router)
 app.include_router(chips.router)
 app.include_router(decision_runs.router)
+app.include_router(evaluation.router)
