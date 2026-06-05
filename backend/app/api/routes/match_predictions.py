@@ -1,9 +1,10 @@
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_, desc
+from sqlalchemy import or_, desc
 import math
 
 from app.core.db import get_db
+from app.core.season import get_current_season
 from app.models.fixture import Fixture
 from app.models.team import Team
 from app.models.match_prediction import MatchPrediction
@@ -27,7 +28,6 @@ def softmax3(a: float, b: float, c: float):
 
 
 def team_points_for_fixture(team_id: int, f: Fixture) -> int:
-    # Requires finished + non-null scores
     hs = int(f.home_score)
     as_ = int(f.away_score)
 
@@ -43,9 +43,10 @@ def team_points_for_fixture(team_id: int, f: Fixture) -> int:
     return 0
 
 
-def recent_form_avg_points(db: Session, team_id: int, before_time, n: int) -> float:
+def recent_form_avg_points(db: Session, team_id: int, before_time, n: int, season: str) -> float:
     q = (
         db.query(Fixture)
+        .filter(Fixture.season == season)
         .filter(Fixture.finished.is_(True))
         .filter(Fixture.home_score.isnot(None))
         .filter(Fixture.away_score.isnot(None))
@@ -57,7 +58,7 @@ def recent_form_avg_points(db: Session, team_id: int, before_time, n: int) -> fl
     )
     rows = q.all()
     if not rows:
-        return 1.0  # neutral prior
+        return 1.0
 
     pts = [team_points_for_fixture(team_id, f) for f in rows]
     return sum(pts) / len(pts)
@@ -69,17 +70,26 @@ def get_match_prediction(
     model_name: str = Query(DEFAULT_MODEL_NAME),
     db: Session = Depends(get_db),
 ):
+    season = get_current_season()
+
     row = (
         db.query(MatchPrediction)
+        .filter(MatchPrediction.season == season)
         .filter(MatchPrediction.fixture_id == fixture_id)
         .filter(MatchPrediction.model_name == model_name)
         .first()
     )
     if not row:
-        return {"found": False, "fixture_id": fixture_id, "model_name": model_name}
+        return {
+            "found": False,
+            "season": season,
+            "fixture_id": fixture_id,
+            "model_name": model_name,
+        }
 
     return {
         "found": True,
+        "season": season,
         "fixture_id": row.fixture_id,
         "model_name": row.model_name,
         "pred_home_win": row.pred_home_win,
@@ -98,9 +108,16 @@ def run_match_baseline_and_store(
     threshold: float = Query(0.30, ge=0.0, le=2.0),
     db: Session = Depends(get_db),
 ):
-    fixture = db.query(Fixture).filter(Fixture.id == fixture_id).first()
+    season = get_current_season()
+
+    fixture = (
+        db.query(Fixture)
+        .filter(Fixture.season == season)
+        .filter(Fixture.id == fixture_id)
+        .first()
+    )
     if not fixture:
-        return {"ok": False, "error": f"fixture_id={fixture_id} not found"}
+        return {"ok": False, "error": f"fixture_id={fixture_id} not found for season={season}"}
 
     if fixture.kickoff_time is None:
         return {"ok": False, "error": "fixture has no kickoff_time"}
@@ -108,18 +125,16 @@ def run_match_baseline_and_store(
     home_id = fixture.home_team_id
     away_id = fixture.away_team_id
 
-    # Team name lookup
     team_rows = db.query(Team.id, Team.name).filter(Team.id.in_([home_id, away_id])).all()
     team_map = {tid: name for tid, name in team_rows}
     home_name = team_map.get(home_id, f"Unknown({home_id})")
     away_name = team_map.get(away_id, f"Unknown({away_id})")
 
-    home_avg = recent_form_avg_points(db, home_id, fixture.kickoff_time, n)
-    away_avg = recent_form_avg_points(db, away_id, fixture.kickoff_time, n)
+    home_avg = recent_form_avg_points(db, home_id, fixture.kickoff_time, n, season)
+    away_avg = recent_form_avg_points(db, away_id, fixture.kickoff_time, n, season)
 
     diff = home_avg - away_avg
 
-    # Decision rule
     if diff > threshold:
         pred_result = "H"
     elif diff < -threshold:
@@ -127,17 +142,17 @@ def run_match_baseline_and_store(
     else:
         pred_result = "D"
 
-    # Convert diff into probabilities (simple softmax)
     scale = 1.0
     pH, pD, pA = softmax3(scale * diff, 0.0, -scale * diff)
 
-    # Idempotent write: delete old, insert new
     db.query(MatchPrediction).filter(
+        MatchPrediction.season == season,
         MatchPrediction.fixture_id == fixture_id,
         MatchPrediction.model_name == model_name,
     ).delete()
 
     row = MatchPrediction(
+        season=season,
         fixture_id=fixture_id,
         model_name=model_name,
         pred_home_win=float(pH),
@@ -151,6 +166,7 @@ def run_match_baseline_and_store(
 
     return {
         "ok": True,
+        "season": season,
         "fixture": {
             "id": fixture.id,
             "kickoff_time": fixture.kickoff_time.isoformat(),
@@ -178,15 +194,18 @@ def run_match_baseline_and_store(
         },
     }
 
+
 @router.get("/list")
 def list_match_predictions(
     gw: int = Query(..., ge=1),
     model_name: str = Query(DEFAULT_MODEL_NAME),
     db: Session = Depends(get_db),
 ):
-    # 1) get fixtures for the GW
+    season = get_current_season()
+
     fixtures = (
         db.query(Fixture)
+        .filter(Fixture.season == season)
         .filter(Fixture.gw == gw)
         .filter(Fixture.kickoff_time.isnot(None))
         .order_by(Fixture.kickoff_time.asc())
@@ -195,18 +214,25 @@ def list_match_predictions(
 
     fixture_ids = [f.id for f in fixtures]
     if not fixture_ids:
-        return {"meta": {"gw": gw, "model_name": model_name, "count": 0}, "rows": []}
+        return {
+            "meta": {
+                "season": season,
+                "gw": gw,
+                "model_name": model_name,
+                "count": 0,
+            },
+            "rows": [],
+        }
 
-    # 2) get predictions for those fixtures
     preds = (
         db.query(MatchPrediction)
+        .filter(MatchPrediction.season == season)
         .filter(MatchPrediction.model_name == model_name)
         .filter(MatchPrediction.fixture_id.in_(fixture_ids))
         .all()
     )
     pred_map = {p.fixture_id: p for p in preds}
 
-    # 3) team name lookup
     team_ids = set()
     for f in fixtures:
         team_ids.add(f.home_team_id)
@@ -221,6 +247,7 @@ def list_match_predictions(
         rows.append(
             {
                 "fixture_id": f.id,
+                "season": season,
                 "gw": f.gw,
                 "kickoff_time": f.kickoff_time.isoformat() if f.kickoff_time else None,
                 "home_team_id": f.home_team_id,
@@ -240,15 +267,27 @@ def list_match_predictions(
             }
         )
 
-    return {"meta": {"gw": gw, "model_name": model_name, "count": len(rows)}, "rows": rows}
+    return {
+        "meta": {
+            "season": season,
+            "gw": gw,
+            "model_name": model_name,
+            "count": len(rows),
+        },
+        "rows": rows,
+    }
+
 
 @router.get("/models")
 def list_match_models(
     active_only: bool = Query(False),
     db: Session = Depends(get_db),
 ):
+    season = get_current_season()
+
     rows = (
         db.query(MatchPrediction.model_name)
+        .filter(MatchPrediction.season == season)
         .filter(MatchPrediction.model_name.isnot(None))
         .filter(MatchPrediction.model_name != "")
         .distinct()
@@ -278,6 +317,7 @@ def list_match_models(
             "selected_reason": meta_artifact.selected_reason if meta_artifact else None,
             "notes": meta_artifact.notes if meta_artifact else None,
             "metadata": {
+                "season": season,
                 "feature_version": meta_artifact.feature_version if meta_artifact else None,
                 "training_window_start_gw": meta_artifact.training_window_start_gw if meta_artifact else None,
                 "training_window_end_gw": meta_artifact.training_window_end_gw if meta_artifact else None,
@@ -300,11 +340,13 @@ def list_match_models(
     return {
         "models": models,
         "meta": {
+            "season": season,
             "count": len(models),
             "source": "match_predictions_distinct_plus_model_metadata",
             "active_only": active_only,
         },
     }
+
 
 @router.post("/run_gw")
 def run_match_baseline_for_gw(
@@ -314,9 +356,11 @@ def run_match_baseline_for_gw(
     threshold: float = Query(0.30, ge=0.0, le=2.0),
     db: Session = Depends(get_db),
 ):
-    # 1) load fixtures for the GW (kickoff_time required)
+    season = get_current_season()
+
     fixtures = (
         db.query(Fixture)
+        .filter(Fixture.season == season)
         .filter(Fixture.gw == gw)
         .filter(Fixture.kickoff_time.isnot(None))
         .order_by(Fixture.kickoff_time.asc())
@@ -324,9 +368,8 @@ def run_match_baseline_for_gw(
     )
 
     if not fixtures:
-        return {"ok": False, "error": f"No fixtures found for gw={gw} (kickoff_time is required)."}
+        return {"ok": False, "error": f"No fixtures found for season={season}, gw={gw} (kickoff_time is required)."}
 
-    # 2) run baseline for each fixture (reuse the same logic as /run)
     results = []
     success = 0
     failed = 0
@@ -336,14 +379,13 @@ def run_match_baseline_for_gw(
             home_id = f.home_team_id
             away_id = f.away_team_id
 
-            # Team name lookup
             team_rows = db.query(Team.id, Team.name).filter(Team.id.in_([home_id, away_id])).all()
             team_map = {tid: name for tid, name in team_rows}
             home_name = team_map.get(home_id, f"Unknown({home_id})")
             away_name = team_map.get(away_id, f"Unknown({away_id})")
 
-            home_avg = recent_form_avg_points(db, home_id, f.kickoff_time, n)
-            away_avg = recent_form_avg_points(db, away_id, f.kickoff_time, n)
+            home_avg = recent_form_avg_points(db, home_id, f.kickoff_time, n, season)
+            away_avg = recent_form_avg_points(db, away_id, f.kickoff_time, n, season)
             diff = home_avg - away_avg
 
             if diff > threshold:
@@ -356,13 +398,14 @@ def run_match_baseline_for_gw(
             scale = 1.0
             pH, pD, pA = softmax3(scale * diff, 0.0, -scale * diff)
 
-            # idempotent write
             db.query(MatchPrediction).filter(
+                MatchPrediction.season == season,
                 MatchPrediction.fixture_id == f.id,
                 MatchPrediction.model_name == model_name,
             ).delete()
 
             row = MatchPrediction(
+                season=season,
                 fixture_id=f.id,
                 model_name=model_name,
                 pred_home_win=float(pH),
@@ -378,6 +421,7 @@ def run_match_baseline_for_gw(
             results.append(
                 {
                     "fixture_id": f.id,
+                    "season": season,
                     "gw": gw,
                     "kickoff_time": f.kickoff_time.isoformat() if f.kickoff_time else None,
                     "home_team_id": home_id,
@@ -396,6 +440,7 @@ def run_match_baseline_for_gw(
             results.append(
                 {
                     "fixture_id": getattr(f, "id", None),
+                    "season": season,
                     "gw": gw,
                     "error": str(e),
                 }
@@ -404,6 +449,7 @@ def run_match_baseline_for_gw(
     return {
         "ok": True,
         "meta": {
+            "season": season,
             "gw": gw,
             "model_name": model_name,
             "n_form": n,

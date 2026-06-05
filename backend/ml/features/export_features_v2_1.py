@@ -1,7 +1,9 @@
+
 import os
 import pandas as pd
 from sqlalchemy import create_engine, text
 
+from app.core.season import get_current_season
 from ml.features.team_context import (
     build_team_context_from_team_fixture,
     build_team_fixture_context,
@@ -74,12 +76,13 @@ def export_features_v2_1(start_gw: int, end_gw: int, out_csv: str) -> None:
             'DATABASE_URL is not set. Example: export DATABASE_URL="postgresql://app:app@localhost:5432/epl"'
         )
 
+    season = get_current_season()
     engine = create_engine(db_url)
 
     with engine.begin() as conn:
         df = pd.read_sql(
             text(
-                '''
+                """
                 SELECT
                   s.player_id,
                   s.gw,
@@ -94,20 +97,23 @@ def export_features_v2_1(start_gw: int, end_gw: int, out_csv: str) -> None:
                   p.team_id
                 FROM player_gw_stats s
                 JOIN players p ON p.id = s.player_id
-                WHERE s.gw BETWEEN :start_gw AND :end_gw
+                WHERE s.season = :season
+                  AND s.gw BETWEEN :start_gw AND :end_gw
                 ORDER BY s.player_id, s.gw
-                '''
+                """
             ),
             conn,
-            params={"start_gw": start_gw, "end_gw": end_gw},
+            params={"season": season, "start_gw": start_gw, "end_gw": end_gw},
         )
 
         if df.empty:
-            raise RuntimeError(f"No rows found in player_gw_stats for gw range [{start_gw}, {end_gw}]")
+            raise RuntimeError(
+                f"No rows found in player_gw_stats for season={season} gw range [{start_gw}, {end_gw}]"
+            )
 
         fixtures_history = pd.read_sql(
             text(
-                '''
+                """
                 SELECT
                   gw,
                   kickoff_time,
@@ -116,16 +122,17 @@ def export_features_v2_1(start_gw: int, end_gw: int, out_csv: str) -> None:
                   home_score,
                   away_score
                 FROM fixtures
-                WHERE gw BETWEEN 1 AND :end_gw
+                WHERE season = :season
+                  AND gw BETWEEN 1 AND :end_gw
                   AND kickoff_time IS NOT NULL
                   AND finished = TRUE
                   AND home_score IS NOT NULL
                   AND away_score IS NOT NULL
                 ORDER BY kickoff_time ASC
-                '''
+                """
             ),
             conn,
-            params={"end_gw": end_gw},
+            params={"season": season, "end_gw": end_gw},
         )
 
     g = df.groupby("player_id", group_keys=False)
@@ -157,7 +164,6 @@ def export_features_v2_1(start_gw: int, end_gw: int, out_csv: str) -> None:
         .apply(lambda x: (pd.Series(x) >= 60).sum())
     )
 
-    # Day56 intrinsic / availability proxies
     df["recent_zero_min_count"] = (
         g["minutes"]
         .shift(1)
@@ -179,12 +185,7 @@ def export_features_v2_1(start_gw: int, end_gw: int, out_csv: str) -> None:
         .apply(lambda x: (pd.Series(x) >= 60).mean())
     )
 
-    df["minutes_std_roll5"] = (
-        g["minutes"]
-        .shift(1)
-        .rolling(5, min_periods=2)
-        .std()
-    )
+    df["minutes_std_roll5"] = g["minutes"].shift(1).rolling(5, min_periods=2).std()
 
     pts_roll3 = g["total_points"].shift(1).rolling(3, min_periods=1).mean()
     pts_roll5 = g["total_points"].shift(1).rolling(5, min_periods=1).mean()
@@ -215,7 +216,6 @@ def export_features_v2_1(start_gw: int, end_gw: int, out_csv: str) -> None:
     )
 
     df["minutes_drop_recent"] = mins_roll5 - mins_roll3
-
     df["now_cost_m"] = df["now_cost"] / 10.0
 
     if not fixtures_history.empty:

@@ -1,7 +1,9 @@
+
 import os
 import pandas as pd
 from sqlalchemy import create_engine, text
 
+from app.core.season import get_current_season
 from ml.features.team_context import (
     build_team_context_from_team_fixture,
     build_team_fixture_context,
@@ -157,12 +159,13 @@ def export_match_dataset_v2(start_gw: int, end_gw: int, n_form: int, out_csv: st
     if not db_url:
         raise RuntimeError('DATABASE_URL is not set. Example: export DATABASE_URL="postgresql://app:app@localhost:5432/epl"')
 
+    season = get_current_season()
     engine = create_engine(db_url)
 
     with engine.begin() as conn:
         target_fixtures = pd.read_sql(
             text(
-                '''
+                """
                 SELECT
                   id AS fixture_id,
                   gw,
@@ -172,24 +175,27 @@ def export_match_dataset_v2(start_gw: int, end_gw: int, n_form: int, out_csv: st
                   home_score,
                   away_score
                 FROM fixtures
-                WHERE gw BETWEEN :start_gw AND :end_gw
+                WHERE season = :season
+                  AND gw BETWEEN :start_gw AND :end_gw
                   AND kickoff_time IS NOT NULL
                   AND finished = TRUE
                   AND home_score IS NOT NULL
                   AND away_score IS NOT NULL
                 ORDER BY kickoff_time ASC
-                '''
+                """
             ),
             conn,
-            params={"start_gw": start_gw, "end_gw": end_gw},
+            params={"season": season, "start_gw": start_gw, "end_gw": end_gw},
         )
 
         if target_fixtures.empty:
-            raise RuntimeError(f"No finished fixtures found in gw range [{start_gw}, {end_gw}]")
+            raise RuntimeError(
+                f"No finished fixtures found in season={season} gw range [{start_gw}, {end_gw}]"
+            )
 
         history_fixtures = pd.read_sql(
             text(
-                '''
+                """
                 SELECT
                   id AS fixture_id,
                   gw,
@@ -199,16 +205,17 @@ def export_match_dataset_v2(start_gw: int, end_gw: int, n_form: int, out_csv: st
                   home_score,
                   away_score
                 FROM fixtures
-                WHERE gw BETWEEN 1 AND :end_gw
+                WHERE season = :season
+                  AND gw BETWEEN 1 AND :end_gw
                   AND kickoff_time IS NOT NULL
                   AND finished = TRUE
                   AND home_score IS NOT NULL
                   AND away_score IS NOT NULL
                 ORDER BY kickoff_time ASC
-                '''
+                """
             ),
             conn,
-            params={"end_gw": end_gw},
+            params={"season": season, "end_gw": end_gw},
         )
 
     target_fixtures["kickoff_time"] = pd.to_datetime(target_fixtures["kickoff_time"], utc=True)
@@ -237,7 +244,6 @@ def export_match_dataset_v2(start_gw: int, end_gw: int, n_form: int, out_csv: st
 
     team_fixture_context = _add_rest_days(team_fixture_context)
 
-    # Keep only target export range after context is fully built from history
     tfc_target = team_fixture_context[
         (team_fixture_context["gw"] >= start_gw) & (team_fixture_context["gw"] <= end_gw)
     ].copy()
@@ -327,7 +333,6 @@ def export_match_dataset_v2(start_gw: int, end_gw: int, n_form: int, out_csv: st
         how="left",
     )
 
-    # Derived comparison features
     out["strength_diff_recent"] = (
         out["home_attack_strength_recent"] - out["away_attack_strength_recent"]
     )
@@ -341,7 +346,6 @@ def export_match_dataset_v2(start_gw: int, end_gw: int, n_form: int, out_csv: st
         out["away_team_rank_before_gw"] - out["home_team_rank_before_gw"]
     )
 
-    # Goals foundation targets
     out["home_goals"] = out["home_score"]
     out["away_goals"] = out["away_score"]
 
@@ -356,7 +360,6 @@ def export_match_dataset_v2(start_gw: int, end_gw: int, n_form: int, out_csv: st
 
     out["result_label"] = out.apply(make_label, axis=1)
 
-    # Limited H2H signals
     h2h = _compute_h2h_features(history_fixtures, target_fixtures, n_h2h=n_h2h)
     out = out.merge(h2h, on="fixture_id", how="left")
 

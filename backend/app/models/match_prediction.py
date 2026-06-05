@@ -8,6 +8,9 @@ class MatchPrediction(Base):
     __tablename__ = "match_predictions"
 
     id = Column(Integer, primary_key=True, index=True)
+
+    season = Column(String(16), nullable=False, default="2025_26", index=True)
+
     fixture_id = Column(Integer, ForeignKey("fixtures.id", ondelete="CASCADE"), nullable=False)
     model_name = Column(String(50), nullable=False)
 

@@ -1,4 +1,4 @@
-from sqlalchemy import Integer, ForeignKey, UniqueConstraint
+from sqlalchemy import Integer, ForeignKey, UniqueConstraint, String
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.core.db import Base
@@ -8,6 +8,8 @@ class PlayerGameweekStat(Base):
     __tablename__ = "player_gw_stats"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    season: Mapped[str] = mapped_column(String(16), nullable=False, default="2025_26", index=True)
 
     # FK -> players.id
     player_id: Mapped[int] = mapped_column(ForeignKey("players.id"), index=True)

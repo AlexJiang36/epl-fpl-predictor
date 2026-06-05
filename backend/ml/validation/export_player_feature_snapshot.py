@@ -1,92 +1,143 @@
-from __future__ import annotations
 
 import argparse
-import os
+import json
 import subprocess
+from datetime import datetime, timezone
 from pathlib import Path
+from uuid import uuid4
 
-from app.utils.feature_snapshot_store import (
-    create_feature_snapshot_artifact,
-    save_feature_snapshot_artifact,
-)
+import pandas as pd
+
+from app.core.season import get_current_season
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
-        description="Export player feature snapshot with metadata artifact."
-    )
-    parser.add_argument("--gw-start", type=int, required=True)
-    parser.add_argument("--gw-end", type=int, required=True)
-    parser.add_argument("--feature-version", type=str, default="v0")
-    parser.add_argument("--model-name", type=str, default="baseline_rollavg_v0")
-    parser.add_argument(
-        "--out-csv",
-        type=str,
-        required=True,
-        help="Output CSV path, e.g. artifacts/offline_datasets/player_features_gw1_27_v2.csv",
-    )
-    return parser.parse_args()
+EXPORT_MODULE_BY_FEATURE_VERSION = {
+    "v0": "ml.features.export_features_v0",
+    "v2": "ml.features.export_features_v2",
+    "v2_1": "ml.features.export_features_v2_1",
+}
+
+
+def utc_stamp() -> str:
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def ensure_parent_dir(path_str: str) -> None:
+    Path(path_str).parent.mkdir(parents=True, exist_ok=True)
+
+
+def default_player_csv_path(season: str, gw_start: int, gw_end: int, feature_version: str) -> str:
+    return f"artifacts/offline_datasets/player_features_{season}_gw{gw_start}_{gw_end}_{feature_version}.csv"
+
+
+def default_snapshot_json_path(snapshot_id: str) -> str:
+    return f"artifacts/feature_snapshots/{snapshot_id}.json"
+
+
+def resolve_export_module(feature_version: str) -> str:
+    module_name = EXPORT_MODULE_BY_FEATURE_VERSION.get(feature_version)
+    if not module_name:
+        supported = ", ".join(sorted(EXPORT_MODULE_BY_FEATURE_VERSION))
+        raise RuntimeError(
+            f"Unsupported feature_version={feature_version!r}. Supported values: {supported}"
+        )
+    return module_name
+
+
+def count_rows(csv_path: str) -> int:
+    df = pd.read_csv(csv_path)
+    return int(len(df))
+
+
+def build_metadata(
+    *,
+    snapshot_id: str,
+    season: str,
+    gw_start: int,
+    gw_end: int,
+    feature_version: str,
+    model_name: str,
+    out_csv: str,
+    row_count: int,
+    export_module: str,
+) -> dict:
+    return {
+        "snapshot_id": snapshot_id,
+        "artifact_type": "player_feature_snapshot",
+        "season": season,
+        "training_season_start": season,
+        "training_season_end": season,
+        "evaluation_season": season,
+        "gw_start": gw_start,
+        "gw_end": gw_end,
+        "feature_version": feature_version,
+        "model_name": model_name,
+        "export_module": export_module,
+        "exported_csv": out_csv,
+        "row_count": row_count,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+    }
 
 
 def main() -> None:
-    args = parse_args()
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--gw-start", type=int, required=True)
+    ap.add_argument("--gw-end", type=int, required=True)
+    ap.add_argument("--feature-version", required=True)
+    ap.add_argument("--model-name", required=True)
+    ap.add_argument("--out-csv", default=None)
+    args = ap.parse_args()
 
-    out_csv = Path(args.out_csv)
-    out_csv.parent.mkdir(parents=True, exist_ok=True)
+    season = get_current_season()
+    out_csv = args.out_csv or default_player_csv_path(
+        season=season,
+        gw_start=args.gw_start,
+        gw_end=args.gw_end,
+        feature_version=args.feature_version,
+    )
 
-    if args.feature_version == "v0":
-        module_name = "ml.features.export_features_v0"
-        source_tables = ["player_gw_stats", "players"]
-        notes = "Offline player feature snapshot export (v0)."
-    elif args.feature_version == "v2":
-        module_name = "ml.features.export_features_v2"
-        source_tables = ["player_gw_stats", "players", "fixtures"]
-        notes = "Offline player feature snapshot export (v2)."
-    elif args.feature_version == "v2_1":
-        module_name = "ml.features.export_features_v2_1"
-        source_tables = ["player_gw_stats", "players", "fixtures"]
-        notes = "Offline player feature snapshot export (v2_1) with intrinsic / availability proxies."
-    else:
-        raise RuntimeError(f"Unsupported feature version: {args.feature_version}")
+    export_module = resolve_export_module(args.feature_version)
+
+    ensure_parent_dir(out_csv)
 
     export_cmd = [
         "python",
         "-m",
-        module_name,
+        export_module,
         "--start_gw",
         str(args.gw_start),
         "--end_gw",
         str(args.gw_end),
         "--out",
-        str(out_csv),
+        out_csv,
     ]
+    subprocess.run(export_cmd, check=True)
 
-    child_env = os.environ.copy()
-    subprocess.run(export_cmd, check=True, env=child_env)
+    row_count = count_rows(out_csv)
 
-    row_count = 0
-    if out_csv.exists():
-        with out_csv.open("r", encoding="utf-8") as f:
-            row_count = max(sum(1 for _ in f) - 1, 0)
-
-    artifact = create_feature_snapshot_artifact(
-        snapshot_type="player_features",
-        feature_version=args.feature_version,
+    short_id = uuid4().hex[:8]
+    snapshot_id = f"player_features_{utc_stamp()}_{short_id}"
+    metadata = build_metadata(
+        snapshot_id=snapshot_id,
+        season=season,
         gw_start=args.gw_start,
         gw_end=args.gw_end,
-        output_path=str(out_csv),
-        source_tables=source_tables,
+        feature_version=args.feature_version,
         model_name=args.model_name,
+        out_csv=out_csv,
         row_count=row_count,
-        notes=notes,
+        export_module=export_module,
     )
 
-    meta_path = save_feature_snapshot_artifact(artifact)
+    metadata_path = default_snapshot_json_path(snapshot_id)
+    ensure_parent_dir(metadata_path)
+    with open(metadata_path, "w", encoding="utf-8") as f:
+        json.dump(metadata, f, ensure_ascii=False, indent=2)
 
-    print("exported_csv:", out_csv)
-    print("row_count:", row_count)
-    print("saved_metadata:", meta_path)
-    print("snapshot_id:", artifact.snapshot_id)
+    print(f"exported_csv: {out_csv}")
+    print(f"row_count: {row_count}")
+    print(f"saved_metadata: {metadata_path}")
+    print(f"snapshot_id: {snapshot_id}")
 
 
 if __name__ == "__main__":

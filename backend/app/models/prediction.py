@@ -13,7 +13,9 @@ class Prediction(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
-    player_id: Mapped[int] = mapped_column(ForeignKey("players.id"),  index=True)
+    season: Mapped[str] = mapped_column(String(16), nullable=False, default="2025_26", index=True)
+
+    player_id: Mapped[int] = mapped_column(ForeignKey("players.id"), index=True)
 
     target_gw: Mapped[int] = mapped_column(Integer, index=True)
 
@@ -26,4 +28,3 @@ class Prediction(Base):
         server_default=func.now(),
         nullable=False,
     )
-

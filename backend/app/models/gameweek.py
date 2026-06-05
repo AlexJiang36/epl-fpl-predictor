@@ -1,5 +1,5 @@
 from typing import Optional
-from sqlalchemy import Integer, Boolean, DateTime
+from sqlalchemy import Integer, Boolean, DateTime, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -8,6 +8,8 @@ class Gameweek(Base):
     __tablename__ = "gameweeks"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    season: Mapped[str] = mapped_column(String(16), nullable=False, default="2025_26", index=True)
 
     # FPL event id (gameweek number)
     gw: Mapped[int] = mapped_column(Integer, unique=True, index=True)

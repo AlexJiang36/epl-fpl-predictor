@@ -1,6 +1,6 @@
 from typing import Optional
 
-from sqlalchemy import Column, Integer, Boolean, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, Boolean, DateTime, ForeignKey, String
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
@@ -9,6 +9,8 @@ class Fixture(Base):
     __tablename__ = "fixtures"
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
+
+    season: Mapped[str] = mapped_column(String(16), nullable=False, default="2025_26", index=True)
 
     # FPL fixture id (unique id from FPL)
     fpl_fixture_id: Mapped[int] = mapped_column(Integer, unique=True, index=True)
