@@ -8,7 +8,7 @@ from app.core.db import Base
 class Prediction(Base):
     __tablename__ = "predictions"
     __table_args__ = (
-        UniqueConstraint("player_id", "target_gw", "model_name", name="uq_predictions_player_gw_model"),
+        UniqueConstraint("season", "player_id", "target_gw", "model_name", name="uq_predictions_season_player_gw_model"),
     )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)

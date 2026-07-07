@@ -22,7 +22,7 @@ class MatchPrediction(Base):
     created_at = Column(DateTime(timezone=True), server_default=func.now(), nullable=False)
 
     __table_args__ = (
-        UniqueConstraint("fixture_id", "model_name", name="uq_match_predictions_fixture_model"),
+        UniqueConstraint("season", "fixture_id", "model_name", name="uq_match_predictions_season_fixture_model"),
         Index("ix_match_predictions_fixture_id", "fixture_id"),
         Index("ix_match_predictions_model_name", "model_name"),
     )

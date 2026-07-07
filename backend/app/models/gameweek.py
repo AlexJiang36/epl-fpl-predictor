@@ -1,18 +1,21 @@
 from typing import Optional
-from sqlalchemy import Integer, Boolean, DateTime, String
+from sqlalchemy import Integer, Boolean, DateTime, String, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.core.db import Base
 
 class Gameweek(Base):
     __tablename__ = "gameweeks"
+    __table_args__ = (
+        UniqueConstraint("season", "gw", name="uq_gameweeks_season_gw"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
 
     season: Mapped[str] = mapped_column(String(16), nullable=False, default="2025_26", index=True)
 
     # FPL event id (gameweek number)
-    gw: Mapped[int] = mapped_column(Integer, unique=True, index=True)
+    gw: Mapped[int] = mapped_column(Integer, index=True)
 
     # deadline_time from FPL (UTC)
     deadline_time: Mapped[Optional[DateTime]] = mapped_column(DateTime(timezone=True), nullable=True)

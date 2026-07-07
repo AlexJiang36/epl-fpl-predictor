@@ -28,5 +28,5 @@ class PlayerGameweekStat(Base):
     player = relationship("Player")
 
     __table_args__ = (
-        UniqueConstraint("player_id", "gw", name="uq_player_gw_stats_player_id_gw"),
+        UniqueConstraint("season", "player_id", "gw", name="uq_player_gw_stats_season_player_id_gw"),
     )
