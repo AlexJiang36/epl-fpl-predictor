@@ -19,6 +19,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-gw", type=int, required=True)
     parser.add_argument("--model-name", type=str, required=True)
     parser.add_argument(
+        "--season",
+        type=str,
+        default=None,
+        help="Season key, for example 2025_26. Defaults to app.core.season.get_current_season().",
+    )
+    parser.add_argument(
         "--out",
         type=str,
         default="",
@@ -49,8 +55,10 @@ def run_checks(
     target_gw: int,
     model_name: str,
     require_prediction_count_check: bool = True,
+    season: Optional[str] = None,
 ) -> Dict[str, Any]:
-    season = get_current_season()
+    resolved_season = season or get_current_season()
+
     db = SessionLocal()
     try:
         checks: List[Dict[str, Any]] = []
@@ -71,7 +79,7 @@ def run_checks(
             WHERE season = :season
               AND id IS NULL
             """,
-            {"season": season},
+            {"season": resolved_season},
         )
         predictions_null_key = run_scalar_int(
             db,
@@ -86,7 +94,7 @@ def run_checks(
                 OR season IS NULL
               )
             """,
-            {"season": season},
+            {"season": resolved_season},
         )
 
         null_total = players_null_id + teams_null_id + fixtures_null_id + predictions_null_key
@@ -95,7 +103,7 @@ def run_checks(
                 name="no_null_critical_ids",
                 passed=(null_total == 0),
                 details={
-                    "season": season,
+                    "season": resolved_season,
                     "players_null_id": players_null_id,
                     "teams_null_id": teams_null_id,
                     "fixtures_null_id": fixtures_null_id,
@@ -116,14 +124,14 @@ def run_checks(
                 HAVING COUNT(*) > 1
             ) dup
             """,
-            {"season": season},
+            {"season": resolved_season},
         )
         checks.append(
             make_check(
                 name="no_duplicate_prediction_keys",
                 passed=(duplicate_prediction_keys == 0),
                 details={
-                    "season": season,
+                    "season": resolved_season,
                     "duplicate_prediction_key_groups": duplicate_prediction_keys,
                     "expected_unique_key": ["season", "player_id", "target_gw", "model_name"],
                 },
@@ -139,7 +147,7 @@ def run_checks(
               AND kickoff_time IS NOT NULL
               AND gw IS NULL
             """,
-            {"season": season},
+            {"season": resolved_season},
         )
         fixtures_with_kickoff = run_scalar_int(
             db,
@@ -149,14 +157,14 @@ def run_checks(
             WHERE season = :season
               AND kickoff_time IS NOT NULL
             """,
-            {"season": season},
+            {"season": resolved_season},
         )
         checks.append(
             make_check(
                 name="fixtures_gw_coverage_for_kickoff_rows",
                 passed=(fixtures_missing_gw_with_kickoff == 0),
                 details={
-                    "season": season,
+                    "season": resolved_season,
                     "fixtures_with_kickoff_time": fixtures_with_kickoff,
                     "fixtures_missing_gw_with_kickoff_time": fixtures_missing_gw_with_kickoff,
                 },
@@ -174,7 +182,7 @@ def run_checks(
                   AND model_name = :model_name
                 """,
                 {
-                    "season": season,
+                    "season": resolved_season,
                     "target_gw": target_gw,
                     "model_name": model_name,
                 },
@@ -184,7 +192,7 @@ def run_checks(
                     name="prediction_counts_present_for_target_gw_model",
                     passed=(prediction_count_for_target > 0),
                     details={
-                        "season": season,
+                        "season": resolved_season,
                         "target_gw": target_gw,
                         "model_name": model_name,
                         "prediction_row_count": prediction_count_for_target,
@@ -197,7 +205,7 @@ def run_checks(
                     name="prediction_counts_present_for_target_gw_model",
                     passed=True,
                     details={
-                        "season": season,
+                        "season": resolved_season,
                         "target_gw": target_gw,
                         "model_name": model_name,
                         "prediction_row_count": None,
@@ -211,7 +219,7 @@ def run_checks(
 
         report = {
             "created_at": datetime.now(timezone.utc).isoformat(),
-            "season": season,
+            "season": resolved_season,
             "target_gw": target_gw,
             "model_name": model_name,
             "overall_passed": overall_passed,
@@ -253,6 +261,7 @@ def main() -> None:
         target_gw=args.target_gw,
         model_name=args.model_name,
         require_prediction_count_check=not args.skip_prediction_count_check,
+        season=args.season,
     )
     print_summary(report)
     maybe_save_report(report, args.out)
