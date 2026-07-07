@@ -4,11 +4,12 @@ import argparse
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional
 
 from sqlalchemy import text
 
 from app.core.db import SessionLocal
+from app.core.season import get_current_season
 
 
 def parse_args() -> argparse.Namespace:
@@ -39,7 +40,7 @@ def make_check(name: str, passed: bool, details: Dict[str, Any]) -> Dict[str, An
     }
 
 
-def run_scalar_int(db, sql: str, params: Dict[str, Any] = None) -> int:
+def run_scalar_int(db, sql: str, params: Optional[Dict[str, Any]] = None) -> int:
     value = db.execute(text(sql), params or {}).scalar()
     return int(value or 0)
 
@@ -49,32 +50,43 @@ def run_checks(
     model_name: str,
     require_prediction_count_check: bool = True,
 ) -> Dict[str, Any]:
+    season = get_current_season()
     db = SessionLocal()
     try:
         checks: List[Dict[str, Any]] = []
 
-        # 1) no null critical ids after ingest
         players_null_id = run_scalar_int(
             db,
-            "SELECT COUNT(*) FROM players WHERE id IS NULL"
+            "SELECT COUNT(*) FROM players WHERE id IS NULL",
         )
         teams_null_id = run_scalar_int(
             db,
-            "SELECT COUNT(*) FROM teams WHERE id IS NULL"
+            "SELECT COUNT(*) FROM teams WHERE id IS NULL",
         )
         fixtures_null_id = run_scalar_int(
             db,
-            "SELECT COUNT(*) FROM fixtures WHERE id IS NULL"
+            """
+            SELECT COUNT(*)
+            FROM fixtures
+            WHERE season = :season
+              AND id IS NULL
+            """,
+            {"season": season},
         )
         predictions_null_key = run_scalar_int(
             db,
             """
             SELECT COUNT(*)
             FROM predictions
-            WHERE player_id IS NULL
-               OR target_gw IS NULL
-               OR model_name IS NULL
-            """
+            WHERE season = :season
+              AND (
+                   player_id IS NULL
+                OR target_gw IS NULL
+                OR model_name IS NULL
+                OR season IS NULL
+              )
+            """,
+            {"season": season},
         )
 
         null_total = players_null_id + teams_null_id + fixtures_null_id + predictions_null_key
@@ -83,6 +95,7 @@ def run_checks(
                 name="no_null_critical_ids",
                 passed=(null_total == 0),
                 details={
+                    "season": season,
                     "players_null_id": players_null_id,
                     "teams_null_id": teams_null_id,
                     "fixtures_null_id": fixtures_null_id,
@@ -91,76 +104,87 @@ def run_checks(
             )
         )
 
-        # 2) no duplicate prediction keys where uniqueness is expected
         duplicate_prediction_keys = run_scalar_int(
             db,
             """
             SELECT COUNT(*)
             FROM (
-                SELECT player_id, target_gw, model_name, COUNT(*) AS n
+                SELECT season, player_id, target_gw, model_name, COUNT(*) AS n
                 FROM predictions
-                GROUP BY player_id, target_gw, model_name
+                WHERE season = :season
+                GROUP BY season, player_id, target_gw, model_name
                 HAVING COUNT(*) > 1
             ) dup
-            """
+            """,
+            {"season": season},
         )
         checks.append(
             make_check(
                 name="no_duplicate_prediction_keys",
                 passed=(duplicate_prediction_keys == 0),
                 details={
+                    "season": season,
                     "duplicate_prediction_key_groups": duplicate_prediction_keys,
-                    "expected_unique_key": ["player_id", "target_gw", "model_name"],
+                    "expected_unique_key": ["season", "player_id", "target_gw", "model_name"],
                 },
             )
         )
 
-        # 3) fixtures.gw coverage for rows with kickoff_time
         fixtures_missing_gw_with_kickoff = run_scalar_int(
             db,
             """
             SELECT COUNT(*)
             FROM fixtures
-            WHERE kickoff_time IS NOT NULL
+            WHERE season = :season
+              AND kickoff_time IS NOT NULL
               AND gw IS NULL
-            """
+            """,
+            {"season": season},
         )
         fixtures_with_kickoff = run_scalar_int(
             db,
             """
             SELECT COUNT(*)
             FROM fixtures
-            WHERE kickoff_time IS NOT NULL
-            """
+            WHERE season = :season
+              AND kickoff_time IS NOT NULL
+            """,
+            {"season": season},
         )
         checks.append(
             make_check(
                 name="fixtures_gw_coverage_for_kickoff_rows",
                 passed=(fixtures_missing_gw_with_kickoff == 0),
                 details={
+                    "season": season,
                     "fixtures_with_kickoff_time": fixtures_with_kickoff,
                     "fixtures_missing_gw_with_kickoff_time": fixtures_missing_gw_with_kickoff,
                 },
             )
         )
 
-        # 4) prediction counts present for target GW / model
         if require_prediction_count_check:
             prediction_count_for_target = run_scalar_int(
                 db,
                 """
                 SELECT COUNT(*)
                 FROM predictions
-                WHERE target_gw = :target_gw
+                WHERE season = :season
+                  AND target_gw = :target_gw
                   AND model_name = :model_name
                 """,
-                {"target_gw": target_gw, "model_name": model_name},
+                {
+                    "season": season,
+                    "target_gw": target_gw,
+                    "model_name": model_name,
+                },
             )
             checks.append(
                 make_check(
                     name="prediction_counts_present_for_target_gw_model",
                     passed=(prediction_count_for_target > 0),
                     details={
+                        "season": season,
                         "target_gw": target_gw,
                         "model_name": model_name,
                         "prediction_row_count": prediction_count_for_target,
@@ -173,6 +197,7 @@ def run_checks(
                     name="prediction_counts_present_for_target_gw_model",
                     passed=True,
                     details={
+                        "season": season,
                         "target_gw": target_gw,
                         "model_name": model_name,
                         "prediction_row_count": None,
@@ -186,6 +211,7 @@ def run_checks(
 
         report = {
             "created_at": datetime.now(timezone.utc).isoformat(),
+            "season": season,
             "target_gw": target_gw,
             "model_name": model_name,
             "overall_passed": overall_passed,
@@ -198,6 +224,7 @@ def run_checks(
 
 def print_summary(report: Dict[str, Any]) -> None:
     print("=== Refresh Validation Summary ===")
+    print("season:", report["season"])
     print("target_gw:", report["target_gw"])
     print("model_name:", report["model_name"])
     print("overall_passed:", report["overall_passed"])
@@ -205,9 +232,9 @@ def print_summary(report: Dict[str, Any]) -> None:
 
     for check in report["checks"]:
         status = "PASS" if check["passed"] else "FAIL"
-        print(f"[{status}] {check['name']}")
+        print("[%s] %s" % (status, check["name"]))
         for k, v in check["details"].items():
-            print(f"  - {k}: {v}")
+            print("  - %s: %s" % (k, v))
         print()
 
 

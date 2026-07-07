@@ -1,5 +1,5 @@
 from typing import Optional
-from datetime import datetime, timezone
+from datetime import datetime
 
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
@@ -7,23 +7,26 @@ from sqlalchemy import select
 import httpx
 
 from app.core.db import get_db
+from app.core.season import get_current_season
 from app.models.gameweek import Gameweek
 
 router = APIRouter(prefix="/gameweeks", tags=["gameweeks"])
 
 FPL_BOOTSTRAP_URL = "https://fantasy.premierleague.com/api/bootstrap-static/"
 
+
 def parse_dt(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
-    # FPL uses ISO strings like "2025-08-15T17:30:00Z"
     if s.endswith("Z"):
         s = s.replace("Z", "+00:00")
     return datetime.fromisoformat(s)
 
+
 @router.post("/ingest/fpl")
 def ingest_gameweeks(db: Session = Depends(get_db)):
-    # fetch bootstrap
+    season = get_current_season()
+
     data = httpx.get(FPL_BOOTSTRAP_URL, timeout=20).json()
     events = data.get("events", [])
 
@@ -38,10 +41,17 @@ def ingest_gameweeks(db: Session = Depends(get_db)):
         is_finished = bool(e.get("finished"))
         name = e.get("name")
 
-        existing = db.execute(select(Gameweek).where(Gameweek.gw == gw)).scalars().first()
+        existing = db.execute(
+            select(Gameweek).where(
+                Gameweek.season == season,
+                Gameweek.gw == gw,
+            )
+        ).scalars().first()
+
         if existing is None:
             db.add(
                 Gameweek(
+                    season=season,
                     gw=gw,
                     deadline_time=deadline,
                     is_current=is_current,
@@ -53,6 +63,7 @@ def ingest_gameweeks(db: Session = Depends(get_db)):
             inserted += 1
         else:
             changed = False
+
             if existing.deadline_time != deadline:
                 existing.deadline_time = deadline
                 changed = True
@@ -68,20 +79,42 @@ def ingest_gameweeks(db: Session = Depends(get_db)):
             if existing.name != name:
                 existing.name = name
                 changed = True
+
             if changed:
                 updated += 1
 
     db.commit()
 
-    return {"gameweeks": {"inserted": inserted, "updated": updated, "total_source": len(events)}}
+    return {
+        "season": season,
+        "gameweeks": {
+            "inserted": inserted,
+            "updated": updated,
+            "total_source": len(events),
+        },
+    }
 
 
 @router.get("/current")
 def current_and_next(db: Session = Depends(get_db)):
-    current = db.execute(select(Gameweek).where(Gameweek.is_current == True)).scalars().first()
-    nxt = db.execute(select(Gameweek).where(Gameweek.is_next == True)).scalars().first()
+    season = get_current_season()
+
+    current = db.execute(
+        select(Gameweek).where(
+            Gameweek.season == season,
+            Gameweek.is_current == True,
+        )
+    ).scalars().first()
+
+    nxt = db.execute(
+        select(Gameweek).where(
+            Gameweek.season == season,
+            Gameweek.is_next == True,
+        )
+    ).scalars().first()
 
     return {
+        "season": season,
         "current": {
             "gw": current.gw,
             "deadline_time": current.deadline_time.isoformat() if current and current.deadline_time else None,

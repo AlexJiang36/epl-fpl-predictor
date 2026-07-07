@@ -4,6 +4,7 @@ from typing import Any, Dict, List, Optional
 
 from fastapi import APIRouter, Query
 
+from app.core.season import get_current_season
 from app.utils.model_metadata_store import list_model_metadata_artifacts
 
 
@@ -18,10 +19,26 @@ def _metric_value(metrics: Dict[str, float], keys: List[str]) -> Optional[float]
     return None
 
 
-def _serialize_artifact(artifact) -> Dict[str, Any]:
+def _artifact_value(artifact: Any, attr_name: str, default: Any = None) -> Any:
+    return getattr(artifact, attr_name, default)
+
+
+def _artifact_matches_season(artifact: Any, season: str) -> bool:
+    artifact_season = _artifact_value(artifact, "season")
+    # Keep legacy metadata artifacts visible until all metadata has an explicit season.
+    return artifact_season in (None, "", season)
+
+
+def _serialize_artifact(artifact: Any, season: str) -> Dict[str, Any]:
     metrics = artifact.metrics_summary or {}
+    artifact_season = _artifact_value(artifact, "season")
 
     return {
+        "season": artifact_season or season,
+        "metadata_season": artifact_season,
+        "training_season_start": _artifact_value(artifact, "training_season_start"),
+        "training_season_end": _artifact_value(artifact, "training_season_end"),
+        "evaluation_season": _artifact_value(artifact, "evaluation_season"),
         "model_name": artifact.model_name,
         "task_type": artifact.task_type,
         "feature_version": artifact.feature_version,
@@ -77,24 +94,25 @@ def _filter_rows(rows: List[Dict[str, Any]], active_only: bool) -> List[Dict[str
     return [row for row in rows if row["is_active"]]
 
 
+def _load_rows_for_task(task_type: str, season: str) -> List[Dict[str, Any]]:
+    artifacts = [
+        artifact
+        for artifact in list_model_metadata_artifacts(task_type=task_type)
+        if _artifact_matches_season(artifact, season)
+    ]
+    return [_serialize_artifact(artifact, season) for artifact in artifacts]
+
+
 @router.get("/summary")
 def get_evaluation_summary(
     active_only: bool = Query(False, description="Return only active models."),
+    season: Optional[str] = Query(None, description="Season scope. Defaults to current season."),
 ):
-    artifacts = list_model_metadata_artifacts()
+    resolved_season = season or get_current_season()
 
-    player_rows: List[Dict[str, Any]] = []
-    match_result_rows: List[Dict[str, Any]] = []
-    match_goals_rows: List[Dict[str, Any]] = []
-
-    for artifact in artifacts:
-        row = _serialize_artifact(artifact)
-        if artifact.task_type == "player_points":
-            player_rows.append(row)
-        elif artifact.task_type == "match_result":
-            match_result_rows.append(row)
-        elif artifact.task_type == "match_goals":
-            match_goals_rows.append(row)
+    player_rows = _load_rows_for_task("player_points", resolved_season)
+    match_result_rows = _load_rows_for_task("match_result", resolved_season)
+    match_goals_rows = _load_rows_for_task("match_goals", resolved_season)
 
     player_rows = _filter_rows(player_rows, active_only)
     match_result_rows = _filter_rows(match_result_rows, active_only)
@@ -125,16 +143,19 @@ def get_evaluation_summary(
     }
 
     return {
+        "season": resolved_season,
         "production_defaults": production_defaults,
         "player_models": player_rows,
         "match_result_models": match_result_rows,
         "match_goals_models": match_goals_rows,
         "meta": {
+            "season": resolved_season,
             "active_only": active_only,
             "player_model_count": len(player_rows),
             "match_result_model_count": len(match_result_rows),
             "match_goals_model_count": len(match_goals_rows),
             "source": "model_metadata_artifacts",
+            "metadata_season_filter": "matching_season_or_legacy_without_season",
         },
     }
 
@@ -142,19 +163,23 @@ def get_evaluation_summary(
 @router.get("/player-models")
 def get_player_model_evaluation(
     active_only: bool = Query(False, description="Return only active models."),
+    season: Optional[str] = Query(None, description="Season scope. Defaults to current season."),
 ):
-    artifacts = list_model_metadata_artifacts(task_type="player_points")
-    rows = [_serialize_artifact(artifact) for artifact in artifacts]
+    resolved_season = season or get_current_season()
+    rows = _load_rows_for_task("player_points", resolved_season)
     rows = _filter_rows(rows, active_only)
     rows = sorted(rows, key=_player_sort_key)
 
     return {
+        "season": resolved_season,
         "models": rows,
         "meta": {
+            "season": resolved_season,
             "active_only": active_only,
             "count": len(rows),
             "task_type": "player_points",
             "source": "model_metadata_artifacts",
+            "metadata_season_filter": "matching_season_or_legacy_without_season",
         },
     }
 
@@ -162,12 +187,12 @@ def get_player_model_evaluation(
 @router.get("/match-models")
 def get_match_model_evaluation(
     active_only: bool = Query(False, description="Return only active models."),
+    season: Optional[str] = Query(None, description="Season scope. Defaults to current season."),
 ):
-    result_artifacts = list_model_metadata_artifacts(task_type="match_result")
-    goals_artifacts = list_model_metadata_artifacts(task_type="match_goals")
+    resolved_season = season or get_current_season()
 
-    result_rows = [_serialize_artifact(artifact) for artifact in result_artifacts]
-    goals_rows = [_serialize_artifact(artifact) for artifact in goals_artifacts]
+    result_rows = _load_rows_for_task("match_result", resolved_season)
+    goals_rows = _load_rows_for_task("match_goals", resolved_season)
 
     result_rows = _filter_rows(result_rows, active_only)
     goals_rows = _filter_rows(goals_rows, active_only)
@@ -176,12 +201,15 @@ def get_match_model_evaluation(
     goals_rows = sorted(goals_rows, key=_match_goals_sort_key)
 
     return {
+        "season": resolved_season,
         "match_result_models": result_rows,
         "match_goals_models": goals_rows,
         "meta": {
+            "season": resolved_season,
             "active_only": active_only,
             "match_result_count": len(result_rows),
             "match_goals_count": len(goals_rows),
             "source": "model_metadata_artifacts",
+            "metadata_season_filter": "matching_season_or_legacy_without_season",
         },
     }

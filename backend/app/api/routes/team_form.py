@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Optional
 
 from app.core.db import get_db
+from app.core.season import get_current_season
 from app.models.fixture import Fixture
 from app.models.team import Team
 
@@ -14,7 +15,6 @@ router = APIRouter(prefix="/teams", tags=["match"])
 def parse_before(before: Optional[str]) -> Optional[datetime]:
     if not before:
         return None
-    # accepts ISO8601 like "2026-03-14T17:30:00+00:00"
     return datetime.fromisoformat(before.replace("Z", "+00:00"))
 
 
@@ -25,14 +25,15 @@ def team_form(
     before: Optional[str] = Query(None, description="ISO datetime. Only use fixtures with kickoff_time < before."),
     db: Session = Depends(get_db),
 ):
+    season = get_current_season()
     before_dt = parse_before(before)
 
-    # team name
     t = db.query(Team).filter(Team.id == team_id).first()
-    team_name = t.name if t else f"Unknown({team_id})"
+    team_name = t.name if t else "Unknown(%s)" % team_id
 
     q = (
         db.query(Fixture)
+        .filter(Fixture.season == season)
         .filter(Fixture.finished.is_(True))
         .filter(Fixture.kickoff_time.isnot(None))
         .filter(Fixture.home_score.isnot(None))
@@ -47,6 +48,7 @@ def team_form(
     matches_used = len(fixtures)
     if matches_used == 0:
         return {
+            "season": season,
             "team_id": team_id,
             "team_name": team_name,
             "n": n,
@@ -94,6 +96,7 @@ def team_form(
         last_matches.append(
             {
                 "fixture_id": f.id,
+                "season": f.season,
                 "gw": getattr(f, "gw", None),
                 "kickoff_time": f.kickoff_time.isoformat() if f.kickoff_time else None,
                 "opponent_team_id": opp_id,
@@ -104,6 +107,7 @@ def team_form(
         )
 
     return {
+        "season": season,
         "team_id": team_id,
         "team_name": team_name,
         "n": n,

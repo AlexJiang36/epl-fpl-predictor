@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select
 
 from app.core.db import get_db
+from app.core.season import get_current_season
 from app.services.fpl_client import fetch_bootstrap
 from app.models.team import Team
 from app.models.player import Player
@@ -16,6 +17,7 @@ router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 FPL_FIXTURES_URL = "https://fantasy.premierleague.com/api/fixtures/"
 
+
 @router.post("/fpl/bootstrap")
 def ingest_fpl_bootstrap(db: Session = Depends(get_db)):
     data = fetch_bootstrap()
@@ -23,22 +25,22 @@ def ingest_fpl_bootstrap(db: Session = Depends(get_db)):
     teams_data = data.get("teams", [])
     players_data = data.get("elements", [])
 
-    # --- upsert teams ---
     inserted_teams = 0
     updated_teams = 0
 
-    # We assume your Team model has at least: id (pk), fpl_team_id (unique), name
     for t in teams_data:
         fpl_team_id = int(t["id"])
         name = t["name"]
-        short_name = t.get("short_name") or name  # short_name should exist; fallback to name just in case
+        short_name = t.get("short_name") or name
 
-        existing = db.execute(select(Team).where(Team.fpl_team_id == fpl_team_id)).scalar_one_or_none()
+        existing = db.execute(
+            select(Team).where(Team.fpl_team_id == fpl_team_id)
+        ).scalar_one_or_none()
+
         if existing is None:
             db.add(Team(fpl_team_id=fpl_team_id, name=name, short_name=short_name))
             inserted_teams += 1
         else:
-            # update if changed
             changed = False
             if existing.name != name:
                 existing.name = name
@@ -48,25 +50,22 @@ def ingest_fpl_bootstrap(db: Session = Depends(get_db)):
                 changed = True
             if changed:
                 updated_teams += 1
-            
+
     db.commit()
 
-    # Build mapping: FPL team id -> our DB team pk id
     team_rows = db.execute(select(Team)).scalars().all()
     team_map = {t.fpl_team_id: t.id for t in team_rows}
 
-    # --- upsert players ---
     inserted_players = 0
     updated_players = 0
 
-    # FPL element_type mapping
     pos_map = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 
     for p in players_data:
         fpl_player_id = int(p["id"])
         first_name = p["first_name"]
         second_name = p["second_name"]
-        web_name = p['web_name']
+        web_name = p["web_name"]
 
         fpl_team_id = int(p["team"])
         team_id = team_map.get(fpl_team_id)
@@ -75,7 +74,9 @@ def ingest_fpl_bootstrap(db: Session = Depends(get_db)):
         now_cost = int(p["now_cost"])
         status = str(p["status"])
 
-        existing = db.execute(select(Player).where(Player.fpl_player_id == fpl_player_id)).scalar_one_or_none()
+        existing = db.execute(
+            select(Player).where(Player.fpl_player_id == fpl_player_id)
+        ).scalar_one_or_none()
 
         if existing is None:
             db.add(
@@ -117,7 +118,7 @@ def ingest_fpl_bootstrap(db: Session = Depends(get_db)):
 
             if changed:
                 updated_players += 1
-    
+
     db.commit()
 
     return {
@@ -129,14 +130,14 @@ def ingest_fpl_bootstrap(db: Session = Depends(get_db)):
         "players": {
             "inserted": inserted_players,
             "updated": updated_players,
-            "total_source": len(players_data)
+            "total_source": len(players_data),
         },
     }
+
 
 def parse_dt(s: Optional[str]) -> Optional[datetime]:
     if not s:
         return None
-    # FPL often uses "...Z"
     if s.endswith("Z"):
         s = s.replace("Z", "+00:00")
     return datetime.fromisoformat(s)
@@ -144,14 +145,16 @@ def parse_dt(s: Optional[str]) -> Optional[datetime]:
 
 @router.post("/fpl/fixtures")
 def ingest_fpl_fixtures(db: Session = Depends(get_db)):
+    season = get_current_season()
+
     fixtures = httpx.get(FPL_FIXTURES_URL, timeout=30).json()
 
-    # Build mapping: fpl_team_id -> our teams.id (PK)
     teams = db.execute(select(Team)).scalars().all()
     team_map = {t.fpl_team_id: t.id for t in teams}
 
     inserted = 0
     updated = 0
+    skipped = 0
 
     for fx in fixtures:
         fpl_fixture_id = int(fx["id"])
@@ -162,25 +165,28 @@ def ingest_fpl_fixtures(db: Session = Depends(get_db)):
         home_team_id = team_map.get(fpl_home)
         away_team_id = team_map.get(fpl_away)
 
-        # Safety: if mapping missing, skip (should not happen if teams ingested)
         if home_team_id is None or away_team_id is None:
+            skipped += 1
             continue
 
         kickoff_time = parse_dt(fx.get("kickoff_time"))
         gw = int(fx["event"]) if fx.get("event") is not None else None
         finished = bool(fx.get("finished"))
 
-        # scores can be None before match played
         home_score = fx.get("team_h_score")
         away_score = fx.get("team_a_score")
 
         existing = db.execute(
-            select(Fixture).where(Fixture.fpl_fixture_id == fpl_fixture_id)
+            select(Fixture).where(
+                Fixture.season == season,
+                Fixture.fpl_fixture_id == fpl_fixture_id,
+            )
         ).scalars().first()
 
         if existing is None:
             db.add(
                 Fixture(
+                    season=season,
                     fpl_fixture_id=fpl_fixture_id,
                     home_team_id=home_team_id,
                     away_team_id=away_team_id,
@@ -222,4 +228,12 @@ def ingest_fpl_fixtures(db: Session = Depends(get_db)):
 
     db.commit()
 
-    return {"fixtures": {"inserted": inserted, "updated": updated, "total_source": len(fixtures)}}
+    return {
+        "season": season,
+        "fixtures": {
+            "inserted": inserted,
+            "updated": updated,
+            "skipped": skipped,
+            "total_source": len(fixtures),
+        },
+    }

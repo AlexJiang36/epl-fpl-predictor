@@ -5,12 +5,12 @@ from sqlalchemy.orm import Session
 from sqlalchemy import select, func as sa_func
 
 from app.core.db import get_db
+from app.core.season import get_current_season
 from app.models.prediction import Prediction
 from app.models.player_gw_stat import PlayerGameweekStat
 from app.models.gameweek import Gameweek
 from app.models.player import Player
 from app.models.team import Team
-
 
 router = APIRouter(prefix="/predictions", tags=["predictions"])
 MODEL_NAME = "baseline_rollavg_v0"
@@ -20,11 +20,12 @@ OrderBy = Literal["points", "cost", "value"]
 
 def build_predictions_base_query(
     *,
+    season: str,
     target_gw: int,
     model_name: str,
     position: Optional[str] = None,
     team_id: Optional[int] = None,
-    status: Optional[str] = None,  # None means no filter
+    status: Optional[str] = None,
     search: Optional[str] = None,
     max_cost: Optional[int] = None,
     min_predicted_points: Optional[float] = None,
@@ -34,6 +35,7 @@ def build_predictions_base_query(
         .join(Player, Player.id == Prediction.player_id)
         .join(Team, Team.id == Player.team_id)
         .where(
+            Prediction.season == season,
             Prediction.target_gw == target_gw,
             Prediction.model_name == model_name,
         )
@@ -55,7 +57,7 @@ def build_predictions_base_query(
         base = base.where(Prediction.predicted_points >= min_predicted_points)
 
     if search is not None:
-        base = base.where(Player.web_name.ilike(f"%{search}%"))
+        base = base.where(Player.web_name.ilike("%%%s%%" % search))
 
     return base
 
@@ -65,16 +67,16 @@ def apply_predictions_ordering(base, order_by: OrderBy):
         order_clause = Prediction.predicted_points.desc()
     elif order_by == "cost":
         order_clause = Player.now_cost.asc()
-    else:  # value
+    else:
         order_clause = (Prediction.predicted_points / (Player.now_cost + 1)).desc()
 
-    # Always add a stable tie-breaker
     return base.order_by(order_clause, Player.id.asc())
 
 
 def serialize_prediction_row(pred: Prediction, pl: Player, tm: Team):
     return {
         "prediction_id": pred.id,
+        "season": pred.season,
         "player_id": pred.player_id,
         "target_gw": pred.target_gw,
         "model_name": pred.model_name,
@@ -90,26 +92,37 @@ def serialize_prediction_row(pred: Prediction, pl: Player, tm: Team):
         "team_name": tm.name,
     }
 
+
 def run_baseline_rollavg_v0_core(
     *,
     db: Session,
     target_gw: Optional[int],
     window: int,
 ) -> dict:
+    season = get_current_season()
+
     if target_gw is None:
         nxt = (
-            db.execute(select(Gameweek).where(Gameweek.is_next == True))
+            db.execute(
+                select(Gameweek).where(
+                    Gameweek.season == season,
+                    Gameweek.is_next == True,
+                )
+            )
             .scalars()
             .first()
         )
         if nxt is None:
-            return {"error": "No next gameweek found. Run /gameweeks/ingest/fpl first."}
+            return {
+                "error": "No next gameweek found for season=%s. Run /gameweeks/ingest/fpl first." % season
+            }
         target_gw = nxt.gw
 
     finished_gws = (
         db.execute(
             select(Gameweek.gw)
             .where(
+                Gameweek.season == season,
                 Gameweek.is_finished == True,
                 Gameweek.gw < target_gw,
             )
@@ -121,7 +134,9 @@ def run_baseline_rollavg_v0_core(
     )
 
     if len(finished_gws) == 0:
-        return {"error": "No finished gameweeks found. Ingest gameweeks first."}
+        return {
+            "error": "No finished gameweeks found for season=%s. Ingest gameweeks first." % season
+        }
 
     finished_gws_sorted = sorted(finished_gws)
 
@@ -130,7 +145,10 @@ def run_baseline_rollavg_v0_core(
             PlayerGameweekStat.player_id,
             sa_func.avg(PlayerGameweekStat.total_points).label("avg_points"),
         )
-        .where(PlayerGameweekStat.gw.in_(finished_gws))
+        .where(
+            PlayerGameweekStat.season == season,
+            PlayerGameweekStat.gw.in_(finished_gws),
+        )
         .group_by(PlayerGameweekStat.player_id)
     ).all()
 
@@ -143,6 +161,7 @@ def run_baseline_rollavg_v0_core(
         existing = (
             db.execute(
                 select(Prediction).where(
+                    Prediction.season == season,
                     Prediction.player_id == player_id,
                     Prediction.target_gw == target_gw,
                     Prediction.model_name == MODEL_NAME,
@@ -155,6 +174,7 @@ def run_baseline_rollavg_v0_core(
         if existing is None:
             db.add(
                 Prediction(
+                    season=season,
                     player_id=player_id,
                     target_gw=target_gw,
                     model_name=MODEL_NAME,
@@ -169,6 +189,7 @@ def run_baseline_rollavg_v0_core(
     db.commit()
 
     return {
+        "season": season,
         "target_gw": target_gw,
         "window": window,
         "used_finished_gws": finished_gws_sorted,
@@ -177,6 +198,7 @@ def run_baseline_rollavg_v0_core(
         "updated": updated,
         "total_players_predicted": len(rows),
     }
+
 
 @router.post("/baseline/run")
 def run_baseline(
@@ -189,6 +211,7 @@ def run_baseline(
         target_gw=target_gw,
         window=window,
     )
+
 
 @router.get("")
 def list_predictions(
@@ -205,10 +228,10 @@ def list_predictions(
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ):
-    """
-    List predictions for a target gameweek (paginated).
-    """
+    season = get_current_season()
+
     base = build_predictions_base_query(
+        season=season,
         target_gw=target_gw,
         model_name=model_name,
         position=position,
@@ -223,16 +246,16 @@ def list_predictions(
         select(sa_func.count()).select_from(base.subquery())
     ).scalar_one()
 
-    stmt = (
-        apply_predictions_ordering(base, order_by)
-        .offset(offset)
-        .limit(limit)
-    )
-
+    stmt = apply_predictions_ordering(base, order_by).offset(offset).limit(limit)
     results = db.execute(stmt).all()
 
     return {
-        "meta": {"total": total, "limit": limit, "offset": offset},
+        "meta": {
+            "season": season,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        },
         "rows": [serialize_prediction_row(pred, pl, tm) for (pred, pl, tm) in results],
     }
 
@@ -248,21 +271,15 @@ def top_predictions(
     min_predicted_points: Optional[float] = Query(default=None, ge=0),
     order_by: OrderBy = Query(default="value"),
     limit: int = Query(default=15, ge=1, le=200),
-    # allow override availability filter
     status: str = Query(default="a"),
     db: Session = Depends(get_db),
 ):
-    """
-    Convenience shortlist endpoint for FPL-style weekly picks.
+    season = get_current_season()
 
-    Defaults:
-    - status="a" (available)
-    - order_by="value"
-    - limit=15
-    """
-    effective_status: Optional[str] = None if status == "all" else status
+    effective_status = None if status == "all" else status
 
     base = build_predictions_base_query(
+        season=season,
         target_gw=target_gw,
         model_name=model_name,
         position=position,
@@ -277,6 +294,7 @@ def top_predictions(
     results = db.execute(stmt).all()
 
     return {
+        "season": season,
         "target_gw": target_gw,
         "model_name": model_name,
         "limit": limit,

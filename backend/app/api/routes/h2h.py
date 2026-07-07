@@ -1,9 +1,10 @@
 # app/api/routes/h2h.py
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import and_, desc, or_
 from sqlalchemy.orm import Session
-from sqlalchemy import or_, and_, desc
 
 from app.core.db import get_db
+from app.core.season import get_current_season
 from app.models.fixture import Fixture
 from app.models.team import Team
 
@@ -15,11 +16,15 @@ def head_to_head(
     home_team_id: int = Query(..., ge=1),
     away_team_id: int = Query(..., ge=1),
     n: int = Query(5, ge=1, le=50),
+    season: str = Query(None, description="Season key, for example 2025_26. Defaults to current season."),
     db: Session = Depends(get_db),
 ):
-    # Fetch last N finished matches between these two teams (either direction).
+    resolved_season = season or get_current_season()
+
+    # Fetch last N finished matches between these two teams (either direction) in one season.
     q = (
         db.query(Fixture)
+        .filter(Fixture.season == resolved_season)
         .filter(Fixture.finished.is_(True))
         .filter(Fixture.home_score.isnot(None))
         .filter(Fixture.away_score.isnot(None))
@@ -41,18 +46,18 @@ def head_to_head(
 
     fixtures = q.all()
 
-    # Team name lookup (optional but nice)
+    # Team name lookup (optional but nice).
     team_rows = (
-    db.query(Team.id, Team.name)
-    .filter(Team.id.in_([home_team_id, away_team_id]))
-    .all()
-)
+        db.query(Team.id, Team.name)
+        .filter(Team.id.in_([home_team_id, away_team_id]))
+        .all()
+    )
     team_map = {tid: name for (tid, name) in team_rows}
 
     home_name = team_map.get(home_team_id, f"Unknown({home_team_id})")
     away_name = team_map.get(away_team_id, f"Unknown({away_team_id})")
 
-    # Summary stats from the perspective of "home_team_id" argument
+    # Summary stats from the perspective of the home_team_id argument.
     total = len(fixtures)
     home_wins = 0
     away_wins = 0
@@ -65,12 +70,11 @@ def head_to_head(
         hs = int(f.home_score)
         as_ = int(f.away_score)
 
-        # attribute goals to the query's home/away team ids (not fixture home/away)
+        # Attribute goals to the query's home/away team ids, not fixture home/away.
         if f.home_team_id == home_team_id:
             h_goals = hs
             a_goals = as_
         else:
-            # swapped fixture direction
             h_goals = as_
             a_goals = hs
 
@@ -86,6 +90,7 @@ def head_to_head(
 
         out_fixtures.append(
             {
+                "season": resolved_season,
                 "fixture_id": f.id,
                 "fpl_fixture_id": getattr(f, "fpl_fixture_id", None),
                 "kickoff_time": f.kickoff_time.isoformat() if f.kickoff_time else None,
@@ -100,6 +105,7 @@ def head_to_head(
         )
 
     summary = {
+        "season": resolved_season,
         "home_team_id": home_team_id,
         "home_team_name": home_name,
         "away_team_id": away_team_id,
@@ -114,7 +120,14 @@ def head_to_head(
     }
 
     return {
-        "meta": {"n": n, "returned": total},
+        "season": resolved_season,
+        "meta": {
+            "season": resolved_season,
+            "n": n,
+            "returned": total,
+            "home_team_id": home_team_id,
+            "away_team_id": away_team_id,
+        },
         "summary": summary,
         "fixtures": out_fixtures,
     }

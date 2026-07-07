@@ -1,9 +1,11 @@
 from typing import Optional
+
 from fastapi import APIRouter, Depends, Query
 from sqlalchemy.orm import Session
 from sqlalchemy import select, func
 
 from app.core.db import get_db
+from app.core.season import get_current_season
 from app.models.player_gw_stat import PlayerGameweekStat
 
 router = APIRouter(prefix="/player-gw-stats", tags=["player-gw-stats"])
@@ -17,24 +19,34 @@ def list_player_gw_stats(
     offset: int = Query(default=0, ge=0),
     db: Session = Depends(get_db),
 ):
-    stmt = select(PlayerGameweekStat)
+    season = get_current_season()
+
+    stmt = select(PlayerGameweekStat).where(PlayerGameweekStat.season == season)
 
     if player_id is not None:
         stmt = stmt.where(PlayerGameweekStat.player_id == player_id)
     if gw is not None:
         stmt = stmt.where(PlayerGameweekStat.gw == gw)
 
-    total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
+    total = db.execute(
+        select(func.count()).select_from(stmt.subquery())
+    ).scalar_one()
 
     rows = db.execute(
         stmt.order_by(PlayerGameweekStat.id).offset(offset).limit(limit)
     ).scalars().all()
 
     return {
-        "meta": {"total": total, "limit": limit, "offset": offset},
+        "meta": {
+            "season": season,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        },
         "rows": [
             {
                 "id": r.id,
+                "season": r.season,
                 "player_id": r.player_id,
                 "gw": r.gw,
                 "minutes": r.minutes,

@@ -11,6 +11,7 @@ import httpx
 from sqlalchemy import text
 
 from app.core.db import SessionLocal
+from app.core.season import get_current_season
 from app.utils.run_snapshot_store import (
     create_run_snapshot_artifact,
     save_run_snapshot_artifact,
@@ -28,6 +29,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--target-gw", type=int, required=True)
     parser.add_argument("--base-url", type=str, default="http://127.0.0.1:8000")
     parser.add_argument(
+        "--season",
+        type=str,
+        default=None,
+        help=(
+            "Season scope for refresh logging, validation context, and direct DB checks. "
+            "Defaults to app.core.season.get_current_season()."
+        ),
+    )
+    parser.add_argument(
         "--database-url",
         type=str,
         default=os.environ.get("DATABASE_URL", DEFAULT_DATABASE_URL),
@@ -42,7 +52,7 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help=(
             "Repeatable shell-style command template for player prediction refresh. "
-            "Supports {target_gw} and {last_actual_gw}. "
+            "Supports {target_gw}, {last_actual_gw}, and {season}. "
             "If omitted, baseline_rollavg_v0 and baseline_rollavg_v1 defaults are used."
         ),
     )
@@ -52,7 +62,7 @@ def parse_args() -> argparse.Namespace:
         default=[],
         help=(
             "Repeatable shell-style command template for match prediction refresh. "
-            "Supports {target_gw}. "
+            "Supports {target_gw} and {season}. "
             "If omitted, a default /match/predictions/run_gw call is used."
         ),
     )
@@ -91,11 +101,13 @@ def print_pass(step: str) -> None:
     sys.stdout.flush()
 
 
-def run_http_post(name: str, url: str) -> Dict[str, Any]:
-    print_run(name, f"url: {url}")
+def run_http_post(name: str, url: str, season: str) -> Dict[str, Any]:
+    print_run(name, f"season={season}; url: {url}")
     resp = httpx.post(url, timeout=90.0)
     if resp.status_code >= 400:
-        raise RuntimeError(f"{name} failed with status {resp.status_code}: {resp.text}")
+        raise RuntimeError(
+            f"{name} failed for season={season} with status {resp.status_code}: {resp.text}"
+        )
     try:
         payload = resp.json()
     except Exception:
@@ -105,6 +117,7 @@ def run_http_post(name: str, url: str) -> Dict[str, Any]:
         "step": name,
         "ok": True,
         "kind": "http_post",
+        "season": season,
         "url": url,
         "payload": payload,
     }
@@ -118,8 +131,10 @@ def run_shell_command(
 ) -> Dict[str, Any]:
     command = command_template.format(**fmt)
     parts = shlex.split(command)
+    season = fmt.get("season")
+    target_gw = fmt.get("target_gw")
 
-    print_run(name, f"command: {command}")
+    print_run(name, f"season={season}; target_gw={target_gw}; command: {command}")
 
     proc = subprocess.run(
         parts,
@@ -131,7 +146,8 @@ def run_shell_command(
 
     if proc.returncode != 0:
         raise RuntimeError(
-            f"{name} failed with exit code {proc.returncode}\n"
+            f"{name} failed for season={season}, target_gw={target_gw} "
+            f"with exit code {proc.returncode}\n"
             f"STDOUT:\n{proc.stdout}\n\nSTDERR:\n{proc.stderr}"
         )
 
@@ -145,16 +161,20 @@ def run_shell_command(
         "step": name,
         "ok": True,
         "kind": "command",
+        "season": season,
         "command": command,
         "stdout": proc.stdout,
         "stderr": proc.stderr,
     }
 
 
-def get_last_actual_gw() -> Optional[int]:
+def get_last_actual_gw(season: str) -> Optional[int]:
     db = SessionLocal()
     try:
-        value = db.execute(text("SELECT MAX(gw) FROM player_gw_stats")).scalar()
+        value = db.execute(
+            text("SELECT MAX(gw) FROM player_gw_stats WHERE season = :season"),
+            {"season": season},
+        ).scalar()
         if value is None:
             return None
         return int(value)
@@ -177,12 +197,15 @@ def build_default_player_commands(
 
     if include_ridge_next_gw:
         if last_actual_gw is None:
-            raise RuntimeError("Cannot run ridge next-GW forecast: last_actual_gw is unknown.")
+            raise RuntimeError(
+                "Cannot run ridge next-GW forecast: last_actual_gw is unknown."
+            )
         expected_next_gw = last_actual_gw + 1
         if target_gw != expected_next_gw:
             raise RuntimeError(
                 "Cannot run ridge next-GW forecast in default mode: "
-                f"target_gw={target_gw}, but last_actual_gw={last_actual_gw} so expected next gw is {expected_next_gw}."
+                f"target_gw={target_gw}, but last_actual_gw={last_actual_gw} "
+                f"so expected next gw is {expected_next_gw}."
             )
         commands.append(
             "python -m ml.predict.predict_next_gw_ridge_rollform_v1 "
@@ -214,24 +237,29 @@ def build_default_match_commands(
 def run_validation_step(
     *,
     step_name: str,
+    season: str,
     target_gw: int,
     model_name: str,
     require_prediction_count_check: bool,
 ) -> Dict[str, Any]:
     mode = "post-refresh validation" if require_prediction_count_check else "pre-refresh validation"
-    print_run(step_name, mode)
+    print_run(step_name, f"{mode}; season={season}; target_gw={target_gw}; model_name={model_name}")
     report = run_checks(
         target_gw=target_gw,
         model_name=model_name,
         require_prediction_count_check=require_prediction_count_check,
     )
     if not report["overall_passed"]:
-        raise RuntimeError(f"{step_name} failed: {report}")
+        raise RuntimeError(
+            f"{step_name} failed for season={season}, target_gw={target_gw}, "
+            f"model_name={model_name}: {report}"
+        )
     print_pass(step_name)
     return {
         "step": step_name,
         "ok": True,
         "kind": "validation",
+        "season": season,
         "report": report,
     }
 
@@ -256,6 +284,7 @@ def extract_validation_row_counts(report: Dict[str, Any]) -> Dict[str, int]:
 
 def maybe_save_refresh_snapshot(
     *,
+    season: str,
     target_gw: int,
     model_name: str,
     validation_report: Dict[str, Any],
@@ -263,11 +292,17 @@ def maybe_save_refresh_snapshot(
     row_counts = extract_validation_row_counts(validation_report)
     artifact = create_run_snapshot_artifact(
         snapshot_type="refresh_validation",
-        source_command=f"python -m ml.validation.run_weekly_refresh --target-gw {target_gw}",
+        source_command=(
+            "python -m ml.validation.run_weekly_refresh "
+            f"--season {season} --target-gw {target_gw}"
+        ),
         target_gw=target_gw,
         model_name=model_name,
         row_counts=row_counts,
         metadata={
+            "season": season,
+            "target_gw": target_gw,
+            "model_name": model_name,
             "overall_passed": validation_report.get("overall_passed", False),
             "checks": validation_report.get("checks", []),
         },
@@ -279,6 +314,7 @@ def maybe_save_refresh_snapshot(
 
 def maybe_save_decision_snapshot(
     *,
+    season: str,
     target_gw: int,
     model_name: str,
     decision_endpoint: Optional[str],
@@ -295,24 +331,32 @@ def maybe_save_decision_snapshot(
         target_gw=target_gw,
         model_name=model_name,
         row_counts={},
-        metadata={},
+        metadata={
+            "season": season,
+            "target_gw": target_gw,
+            "model_name": model_name,
+        },
         notes="Optional decision-support snapshot recorded by weekly orchestrator.",
     )
     path = save_run_snapshot_artifact(artifact)
     return str(path)
 
 
-def print_summary(results: List[Dict[str, Any]], last_actual_gw: Optional[int]) -> None:
+def print_summary(results: List[Dict[str, Any]], season: str, last_actual_gw: Optional[int]) -> None:
     print("\n=== Weekly Refresh Summary ===")
+    print(f"season: {season}")
     if last_actual_gw is not None:
         print(f"last_actual_gw_after_ingest: {last_actual_gw}")
     for r in results:
         print(f"[PASS] {r['step']}")
         if r["kind"] == "http_post":
+            print(f"  season: {r.get('season')}")
             print(f"  url: {r['url']}")
         elif r["kind"] == "command":
+            print(f"  season: {r.get('season')}")
             print(f"  command: {r['command']}")
         elif r["kind"] == "validation":
+            print(f"  season: {r.get('season')}")
             print(f"  overall_passed: {r['report'].get('overall_passed')}")
         elif r["kind"] == "snapshot":
             print(f"  path: {r['path']}")
@@ -321,18 +365,24 @@ def print_summary(results: List[Dict[str, Any]], last_actual_gw: Optional[int]) 
 
 def main() -> None:
     args = parse_args()
+    season = args.season or get_current_season()
 
     results: List[Dict[str, Any]] = []
     last_actual_gw: Optional[int] = None
     child_env = os.environ.copy()
     child_env["DATABASE_URL"] = args.database_url
+    child_env["FPL_SEASON"] = season
 
     try:
+        print(f"[INFO] season: {season}")
+        sys.stdout.flush()
+
         # 1) refresh gameweeks metadata
         results.append(
             run_http_post(
                 "ingest_gameweeks",
                 f"{args.base_url}/gameweeks/ingest/fpl",
+                season,
             )
         )
 
@@ -341,6 +391,7 @@ def main() -> None:
             run_http_post(
                 "ingest_bootstrap",
                 f"{args.base_url}/ingest/fpl/bootstrap",
+                season,
             )
         )
 
@@ -349,6 +400,7 @@ def main() -> None:
             run_http_post(
                 "ingest_fixtures",
                 f"{args.base_url}/ingest/fpl/fixtures",
+                season,
             )
         )
 
@@ -357,6 +409,7 @@ def main() -> None:
             run_http_post(
                 "ingest_finished_gw_stats",
                 f"{args.base_url}/ingest/fpl/gw/finished",
+                season,
             )
         )
 
@@ -366,17 +419,19 @@ def main() -> None:
                 run_http_post(
                     "ingest_live_gw_stats",
                     f"{args.base_url}/ingest/fpl/gw/{args.live_gw}/live",
+                    season,
                 )
             )
 
         # discover latest actual GW after data ingest
-        last_actual_gw = get_last_actual_gw()
+        last_actual_gw = get_last_actual_gw(season)
         print(f"[INFO] last_actual_gw_after_ingest: {last_actual_gw}")
         sys.stdout.flush()
 
         # 6) pre-refresh validation
         pre_validation_result = run_validation_step(
             step_name="pre_validation",
+            season=season,
             target_gw=args.target_gw,
             model_name=args.validation_model_name,
             require_prediction_count_check=False,
@@ -384,6 +439,7 @@ def main() -> None:
         results.append(pre_validation_result)
 
         fmt: Dict[str, Any] = {
+            "season": season,
             "target_gw": args.target_gw,
             "last_actual_gw": last_actual_gw if last_actual_gw is not None else "",
         }
@@ -428,6 +484,7 @@ def main() -> None:
         # 9) post-refresh validation
         post_validation_result = run_validation_step(
             step_name="post_validation",
+            season=season,
             target_gw=args.target_gw,
             model_name=args.validation_model_name,
             require_prediction_count_check=True,
@@ -436,8 +493,9 @@ def main() -> None:
 
         # 10) optional snapshots
         if args.save_refresh_snapshot:
-            print_run("refresh_snapshot", "saving refresh validation snapshot")
+            print_run("refresh_snapshot", f"saving refresh validation snapshot; season={season}")
             refresh_path = maybe_save_refresh_snapshot(
+                season=season,
                 target_gw=args.target_gw,
                 model_name=args.validation_model_name,
                 validation_report=post_validation_result["report"],
@@ -454,8 +512,9 @@ def main() -> None:
                 print_pass("refresh_snapshot")
 
         if args.save_decision_snapshot:
-            print_run("decision_snapshot", "saving optional decision-support snapshot")
+            print_run("decision_snapshot", f"saving optional decision-support snapshot; season={season}")
             decision_path = maybe_save_decision_snapshot(
+                season=season,
                 target_gw=args.target_gw,
                 model_name=args.validation_model_name,
                 decision_endpoint=args.decision_endpoint,
@@ -472,10 +531,13 @@ def main() -> None:
                 )
                 print_pass("decision_snapshot")
 
-        print_summary(results, last_actual_gw)
+        print_summary(results, season, last_actual_gw)
 
     except Exception as e:
         print("\n=== Weekly Refresh FAILED ===")
+        print(f"season: {season}")
+        print(f"target_gw: {args.target_gw}")
+        print(f"validation_model_name: {args.validation_model_name}")
         if last_actual_gw is not None:
             print(f"last_actual_gw_after_ingest: {last_actual_gw}")
         for r in results:

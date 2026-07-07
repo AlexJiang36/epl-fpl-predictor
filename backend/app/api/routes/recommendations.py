@@ -1,16 +1,15 @@
-# app/api/routes/recommendations.py
-
 from __future__ import annotations
 
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Literal, Tuple
-from pydantic import BaseModel, Field
 
+from pydantic import BaseModel, Field
 from fastapi import APIRouter, Depends, Query
-from sqlalchemy import select, func as sa_func
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.db import get_db
+from app.core.season import get_current_season
 from app.models.prediction import Prediction
 from app.models.player import Player
 from app.models.team import Team
@@ -25,10 +24,9 @@ Position = Literal["GKP", "DEF", "MID", "FWD"]
 OrderBy = Literal["points", "value"]
 ViewMode = Literal["compact", "full"]
 
-SQUAD_RULES: Dict[Position, int] = {"GKP": 2, "DEF": 5, "MID": 5, "FWD": 3}
-# Day13：先把 11 人首发凑齐（默认 3-4-3）
-STARTING_FORMATION: Dict[Position, int] = {"GKP": 1, "DEF": 3, "MID": 4, "FWD": 3}
-POSITION_CYCLE: List[Position] = ["FWD", "MID", "DEF", "GKP"]
+SQUAD_RULES = {"GKP": 2, "DEF": 5, "MID": 5, "FWD": 3}
+STARTING_FORMATION = {"GKP": 1, "DEF": 3, "MID": 4, "FWD": 3}
+POSITION_CYCLE = ["FWD", "MID", "DEF", "GKP"]
 
 
 @router.get("/ping")
@@ -36,23 +34,31 @@ def ping():
     return {"ok": True}
 
 
-# -----------------------------
-# Helpers: querying candidates
-# -----------------------------
 def _decide_target_gw(db: Session, target_gw: Optional[int]) -> Tuple[Optional[int], Optional[str]]:
+    season = get_current_season()
+
     if target_gw is not None:
         return target_gw, None
-    nxt = db.execute(select(Gameweek).where(Gameweek.is_next == True)).scalars().first()
+
+    nxt = db.execute(
+        select(Gameweek).where(
+            Gameweek.season == season,
+            Gameweek.is_next == True,
+        )
+    ).scalars().first()
+
     if nxt is None:
-        return None, "No next gameweek found. Run /gameweeks/ingest/fpl first."
+        return None, "No next gameweek found for season=%s. Run /gameweeks/ingest/fpl first." % season
+
     return int(nxt.gw), None
 
 
 def _base_candidates_query(
     *,
+    season: str,
     target_gw: int,
     model_name: str,
-    status: Optional[str],  # None means no filter
+    status: Optional[str],
     max_cost: Optional[int],
     min_predicted_points: Optional[float],
 ):
@@ -61,6 +67,7 @@ def _base_candidates_query(
         .join(Player, Player.id == Prediction.player_id)
         .join(Team, Team.id == Player.team_id)
         .where(
+            Prediction.season == season,
             Prediction.target_gw == target_gw,
             Prediction.model_name == model_name,
         )
@@ -79,12 +86,10 @@ def _base_candidates_query(
 
 
 def _calc_cost_m(now_cost: int) -> float:
-    # FPL now_cost is like 80 => 8.0m
     return float(now_cost) / 10.0
 
 
 def _calc_value(predicted_points: float, cost_m: float) -> float:
-    # avoid div by zero; cost_m should never be 0, but be safe
     denom = cost_m if cost_m > 0 else 0.1
     return predicted_points / denom
 
@@ -94,6 +99,7 @@ def _serialize_compact(pred: Prediction, pl: Player, tm: Team) -> dict:
     pts = float(pred.predicted_points)
     val = _calc_value(pts, cost_m)
     return {
+        "season": pred.season,
         "name": pl.web_name,
         "position": pl.position,
         "team": tm.short_name,
@@ -112,6 +118,7 @@ def _serialize_full(pred: Prediction, pl: Player, tm: Team) -> dict:
     val = _calc_value(pts, cost_m)
     return {
         "prediction_id": pred.id,
+        "season": pred.season,
         "player_id": pl.id,
         "target_gw": pred.target_gw,
         "model_name": pred.model_name,
@@ -132,7 +139,7 @@ def _serialize_full(pred: Prediction, pl: Player, tm: Team) -> dict:
 def _build_candidate_buckets(
     rows: List[Tuple[Prediction, Player, Team]],
 ) -> Dict[Position, List[Tuple[Prediction, Player, Team]]]:
-    buckets: Dict[Position, List[Tuple[Prediction, Player, Team]]] = {"GKP": [], "DEF": [], "MID": [], "FWD": []}
+    buckets = {"GKP": [], "DEF": [], "MID": [], "FWD": []}
     for pred, pl, tm in rows:
         pos = pl.position
         if pos in buckets:
@@ -147,7 +154,6 @@ def _sort_bucket(bucket: List[Tuple[Prediction, Player, Team]], order_by: OrderB
             key=lambda r: (float(r[0].predicted_points), -int(r[1].now_cost), -int(r[2].id), -int(r[1].id)),
             reverse=True,
         )
-    # value
     return sorted(
         bucket,
         key=lambda r: (
@@ -158,11 +164,8 @@ def _sort_bucket(bucket: List[Tuple[Prediction, Player, Team]], order_by: OrderB
     )
 
 
-# -----------------------------
-# Helpers: feasibility checks
-# -----------------------------
 def _remaining_needed(required: Dict[Position, int], have: Dict[Position, int]) -> Dict[Position, int]:
-    return {p: max(0, required[p] - have.get(p, 0)) for p in required}
+    return dict((p, max(0, required[p] - have.get(p, 0))) for p in required)
 
 
 def _sum_cheapest_cost_m(
@@ -177,7 +180,7 @@ def _sum_cheapest_cost_m(
     if k <= 0:
         return 0.0
 
-    costs: List[float] = []
+    costs = []
     for pred, pl, tm in buckets[pos]:
         if pl.id in selected_player_ids:
             continue
@@ -201,7 +204,6 @@ def _can_complete_squad(
     team_counts: Dict[int, int],
     max_per_team: int,
 ) -> bool:
-    # 1) Quantity check (with team cap applied)
     for pos, need in remaining_needed_total.items():
         if need <= 0:
             continue
@@ -215,7 +217,6 @@ def _can_complete_squad(
         if available < need:
             return False
 
-    # 2) Lower-bound budget check: sum of cheapest possible players needed per position
     min_possible = 0.0
     for pos, need in remaining_needed_total.items():
         if need <= 0:
@@ -235,7 +236,6 @@ def _can_complete_squad(
     return min_possible <= remaining_budget_m + 1e-9
 
 
-
 class TransferRecommendationsRequest(BaseModel):
     target_gw: int
     model_name: str
@@ -246,7 +246,7 @@ class TransferRecommendationsRequest(BaseModel):
 
 
 def _build_squad_team_counts(rows: List[dict]) -> Dict[int, int]:
-    counts: Dict[int, int] = {}
+    counts = {}
     for row in rows:
         team_id = int(row["team_id"])
         counts[team_id] = counts.get(team_id, 0) + 1
@@ -254,7 +254,7 @@ def _build_squad_team_counts(rows: List[dict]) -> Dict[int, int]:
 
 
 def _build_squad_position_counts(rows: List[dict]) -> Dict[str, int]:
-    counts: Dict[str, int] = {"GKP": 0, "DEF": 0, "MID": 0, "FWD": 0}
+    counts = {"GKP": 0, "DEF": 0, "MID": 0, "FWD": 0}
     for row in rows:
         pos = str(row["position"])
         if pos in counts:
@@ -303,7 +303,7 @@ def _validate_transfer_candidate(
     outgoing_position: str,
     outgoing_team_id: int,
     outgoing_now_cost: int,
-    squad_player_ids: set[int],
+    squad_player_ids: set,
     squad_team_counts: Dict[int, int],
     squad_position_counts: Dict[str, int],
     bank: int,
@@ -312,26 +312,22 @@ def _validate_transfer_candidate(
 ) -> Tuple[bool, Optional[str]]:
     if incoming_player.id in squad_player_ids:
         return False, "already_in_squad"
-
     if not _passes_position_compatibility(
         outgoing_position=outgoing_position,
         incoming_position=incoming_player.position,
     ):
         return False, "position_mismatch"
-
     if not _passes_availability_filter(
         incoming_status=incoming_player.status,
         require_available=require_available,
     ):
         return False, "incoming_not_available"
-
     if not _passes_budget_cap(
         outgoing_now_cost=outgoing_now_cost,
         incoming_now_cost=int(incoming_player.now_cost),
         bank=bank,
     ):
         return False, "over_budget"
-
     if not _passes_team_cap(
         squad_team_counts=squad_team_counts,
         outgoing_team_id=outgoing_team_id,
@@ -339,19 +335,18 @@ def _validate_transfer_candidate(
         max_per_team=max_per_team,
     ):
         return False, "team_cap_exceeded"
-
     if not _passes_squad_size_rules(
         squad_position_counts=squad_position_counts,
         outgoing_position=outgoing_position,
         incoming_position=incoming_player.position,
     ):
         return False, "invalid_squad_transition"
-
     return True, None
 
 
 def _serialize_outgoing_candidate(pred: Prediction, pl: Player, tm: Team) -> dict:
     return {
+        "season": pred.season,
         "player_id": pl.id,
         "web_name": pl.web_name,
         "position": pl.position,
@@ -376,32 +371,21 @@ def _rank_outgoing_candidates(rows: List[dict]) -> List[dict]:
 
 
 def _run_transfer_constraint_unit_checks() -> None:
-    # budget cap
     assert _passes_budget_cap(outgoing_now_cost=60, incoming_now_cost=70, bank=10) is True
     assert _passes_budget_cap(outgoing_now_cost=60, incoming_now_cost=71, bank=10) is False
-
-    # max 3 players per club
     assert _passes_team_cap(squad_team_counts={5: 2}, outgoing_team_id=3, incoming_team_id=5, max_per_team=3) is True
     assert _passes_team_cap(squad_team_counts={5: 3}, outgoing_team_id=3, incoming_team_id=5, max_per_team=3) is False
     assert _passes_team_cap(squad_team_counts={3: 3}, outgoing_team_id=3, incoming_team_id=3, max_per_team=3) is True
-
-    # position compatibility
     assert _passes_position_compatibility(outgoing_position="MID", incoming_position="MID") is True
     assert _passes_position_compatibility(outgoing_position="MID", incoming_position="FWD") is False
-
-    # availability filtering
     assert _passes_availability_filter(incoming_status="a", require_available=True) is True
     assert _passes_availability_filter(incoming_status="d", require_available=True) is False
     assert _passes_availability_filter(incoming_status="d", require_available=False) is True
-
-    # squad transitions
     counts = {"GKP": 2, "DEF": 5, "MID": 5, "FWD": 3}
     assert _passes_squad_size_rules(squad_position_counts=counts, outgoing_position="MID", incoming_position="MID") is True
     assert _passes_squad_size_rules(squad_position_counts=counts, outgoing_position="MID", incoming_position="FWD") is False
 
-# -----------------------------
-# Helpers: picking logic
-# -----------------------------
+
 def _try_pick_one(
     *,
     pos: Position,
@@ -410,27 +394,20 @@ def _try_pick_one(
     team_counts: Dict[int, int],
     max_per_team: int,
     remaining_budget_m: float,
-    # constraints:
     total_have: Dict[Position, int],
     total_required: Dict[Position, int],
     starting_have: Dict[Position, int],
-    starting_required: Optional[Dict[Position, int]],  # None means not in starting phase
-    # feasibility:
+    starting_required: Optional[Dict[Position, int]],
     buckets_all: Dict[Position, List[Tuple[Prediction, Player, Team]]],
 ) -> Tuple[Optional[Tuple[Prediction, Player, Team]], Optional[str]]:
-    """
-    Pick the best feasible player from ordered_bucket for position=pos.
-    Returns (picked_row, error_reason_if_none)
-    """
-
     need_total = total_required[pos] - total_have.get(pos, 0)
     if need_total <= 0:
-        return None, f"Position={pos} already full for total squad."
+        return None, "Position=%s already full for total squad." % pos
 
     if starting_required is not None:
         need_start = starting_required[pos] - starting_have.get(pos, 0)
         if need_start <= 0:
-            return None, f"Position={pos} already full for starting XI."
+            return None, "Position=%s already full for starting XI." % pos
 
     for pred, pl, tm in ordered_bucket:
         if pl.id in selected_player_ids:
@@ -442,7 +419,6 @@ def _try_pick_one(
         if cost_m > remaining_budget_m + 1e-9:
             continue
 
-        # Hypothetical add
         selected_player_ids.add(pl.id)
         team_counts[tm.id] = team_counts.get(tm.id, 0) + 1
         total_have[pos] = total_have.get(pos, 0) + 1
@@ -464,7 +440,6 @@ def _try_pick_one(
         if feasible:
             return (pred, pl, tm), None
 
-        # rollback
         selected_player_ids.remove(pl.id)
         team_counts[tm.id] -= 1
         if team_counts[tm.id] <= 0:
@@ -477,7 +452,7 @@ def _try_pick_one(
             if starting_have[pos] <= 0:
                 del starting_have[pos]
 
-    return None, f"No feasible candidate for position={pos} under current constraints."
+    return None, "No feasible candidate for position=%s under current constraints." % pos
 
 
 def _pick_starting_xi(
@@ -488,26 +463,18 @@ def _pick_starting_xi(
     total_required: Dict[Position, int],
     starting_required: Dict[Position, int],
 ) -> Tuple[List[Tuple[Prediction, Player, Team]], float, Dict[int, int], Dict[Position, int], List[str]]:
-    """
-    Returns (starting_rows, remaining_budget, team_counts, total_have_counts, diagnostics_reasons)
-    """
-    selected_ids: set = set()
-    team_counts: Dict[int, int] = {}
-    total_have: Dict[Position, int] = {}
-    starting_have: Dict[Position, int] = {}
-    picked: List[Tuple[Prediction, Player, Team]] = []
-    reasons: List[str] = []
+    selected_ids = set()
+    team_counts = {}
+    total_have = {}
+    starting_have = {}
+    picked = []
+    reasons = []
 
-    # Prepare ordered buckets for both metrics
-    ordered_points = {p: _sort_bucket(buckets[p], "points") for p in buckets}
-    ordered_value = {p: _sort_bucket(buckets[p], "value") for p in buckets}
+    ordered_points = dict((p, _sort_bucket(buckets[p], "points")) for p in buckets)
+    ordered_value = dict((p, _sort_bucket(buckets[p], "value")) for p in buckets)
 
     remaining_budget = budget_m
 
-    # We alternate cycles:
-    # cycle A: points, positions in FWD->MID->DEF->GKP
-    # cycle B: value,  positions in FWD->MID->DEF->GKP
-    # until starting XI complete
     def starting_done() -> bool:
         return all(starting_have.get(p, 0) >= starting_required[p] for p in starting_required)
 
@@ -519,7 +486,7 @@ def _pick_starting_xi(
             reasons.append("Guard hit while building starting XI (unexpected loop).")
             break
 
-        metric: OrderBy = "points" if cycle % 2 == 0 else "value"
+        metric = "points" if cycle % 2 == 0 else "value"
         ordered = ordered_points if metric == "points" else ordered_value
 
         progress_this_cycle = False
@@ -546,13 +513,10 @@ def _pick_starting_xi(
                 remaining_budget -= _calc_cost_m(int(pl.now_cost))
                 progress_this_cycle = True
             else:
-                if err:
-                    # don't spam the response too much; only keep a few
-                    if len(reasons) < 6:
-                        reasons.append(f"[starting:{metric}] {err}")
+                if err and len(reasons) < 6:
+                    reasons.append("[starting:%s] %s" % (metric, err))
 
         if not progress_this_cycle:
-            # cannot progress -> fail early
             if len(reasons) < 6:
                 reasons.append("Cannot progress while building starting XI. Try relaxing filters.")
             break
@@ -572,11 +536,11 @@ def _pick_bench(
     total_required: Dict[Position, int],
     max_per_team: int,
 ) -> Tuple[List[Tuple[Prediction, Player, Team]], float, List[str]]:
-    selected_ids = {pl.id for _, pl, _ in already_selected}
-    picked: List[Tuple[Prediction, Player, Team]] = []
-    reasons: List[str] = []
+    selected_ids = set(pl.id for _, pl, _ in already_selected)
+    picked = []
+    reasons = []
 
-    ordered_value = {p: _sort_bucket(buckets[p], "value") for p in buckets}
+    ordered_value = dict((p, _sort_bucket(buckets[p], "value")) for p in buckets)
 
     guard = 0
     while any(total_have.get(p, 0) < total_required[p] for p in total_required):
@@ -586,9 +550,7 @@ def _pick_bench(
             break
 
         progress = False
-        # Bench: fill missing positions by value. Iterate pos order stable.
         for pos in ["GKP", "DEF", "MID", "FWD"]:
-            pos = pos  # type: ignore[assignment]
             need = total_required[pos] - total_have.get(pos, 0)
             if need <= 0:
                 continue
@@ -602,8 +564,8 @@ def _pick_bench(
                 remaining_budget_m=remaining_budget_m,
                 total_have=total_have,
                 total_required=total_required,
-                starting_have={},            # not used in bench phase
-                starting_required=None,      # bench phase
+                starting_have={},
+                starting_required=None,
                 buckets_all=buckets,
             )
             if picked_row is not None:
@@ -613,7 +575,7 @@ def _pick_bench(
                 progress = True
             else:
                 if err and len(reasons) < 6:
-                    reasons.append(f"[bench:value] {err}")
+                    reasons.append("[bench:value] %s" % err)
 
         if not progress:
             if len(reasons) < 6:
@@ -624,15 +586,17 @@ def _pick_bench(
 
 
 def _group_by_position(rows: List[Tuple[Prediction, Player, Team]]) -> Dict[Position, List[Tuple[Prediction, Player, Team]]]:
-    out: Dict[Position, List[Tuple[Prediction, Player, Team]]] = {"GKP": [], "DEF": [], "MID": [], "FWD": []}
+    out = {"GKP": [], "DEF": [], "MID": [], "FWD": []}
     for pred, pl, tm in rows:
         if pl.position in out:
             out[pl.position].append((pred, pl, tm))
     return out
 
+
 def _get_recent_player_stats(
     *,
     db: Session,
+    season: str,
     player_id: int,
     target_gw: int,
     window: int = 5,
@@ -640,6 +604,7 @@ def _get_recent_player_stats(
     stmt = (
         select(PlayerGameweekStat)
         .where(
+            PlayerGameweekStat.season == season,
             PlayerGameweekStat.player_id == player_id,
             PlayerGameweekStat.gw < target_gw,
         )
@@ -654,7 +619,7 @@ def _build_recent_form_summary(stats: List[PlayerGameweekStat]) -> str:
         return "No recent stats available."
 
     avg_points = sum(float(s.total_points or 0.0) for s in stats) / len(stats)
-    return f"Last {len(stats)} GWs: avg {avg_points:.2f} pts"
+    return "Last %s GWs: avg %.2f pts" % (len(stats), avg_points)
 
 
 def _build_minutes_stability(stats: List[PlayerGameweekStat]) -> dict:
@@ -684,12 +649,6 @@ def _build_minutes_stability(stats: List[PlayerGameweekStat]) -> dict:
         "sample_size": len(stats),
     }
 
-def _captain_label_from_predicted_points(predicted_points: float) -> str:
-    if predicted_points >= 7.0:
-        return "safe"
-    if predicted_points >= 5.5:
-        return "balanced"
-    return "upside"
 
 def _captain_label_from_signals(
     predicted_points: float,
@@ -699,7 +658,6 @@ def _captain_label_from_signals(
     minutes_label = minutes_stability.get("label")
     avg_recent_points = 0.0
 
-    # parse "Last 5 GWs: avg 6.20 pts"
     try:
         parts = recent_form_summary.split("avg ")
         if len(parts) > 1:
@@ -707,64 +665,36 @@ def _captain_label_from_signals(
     except Exception:
         avg_recent_points = 0.0
 
-    # safe = high prediction + stable minutes + decent recent form
-    if (
-        predicted_points >= 7.5
-        and minutes_label == "high"
-        and avg_recent_points >= 5.0
-    ):
+    if predicted_points >= 7.5 and minutes_label == "high" and avg_recent_points >= 5.0:
         return "safe"
 
-    # otherwise treat as upside
     return "upside"
 
-# -----------------------------
-# Endpoint: /recommendations/squad
-# -----------------------------
+
 @router.get("/squad")
 def recommend_squad(
     target_gw: Optional[int] = None,
     model_name: str = Query(default=MODEL_NAME),
-
-    # Filters (keep them light by default; let budget/team cap do most work)
-    status: str = Query(default="a"),  # pass "all" to disable
+    status: str = Query(default="a"),
     max_cost: Optional[int] = Query(default=None, ge=0),
     min_predicted_points: Optional[float] = Query(default=None, ge=0),
-
-    # Squad constraints
     budget_m: float = Query(default=100.0, ge=50.0, le=200.0),
     max_per_team: int = Query(default=3, ge=1, le=3),
-
-    # Output
-    view: ViewMode = Query(default="compact", pattern="^(compact|full)$"),
-
+    view: ViewMode = Query(default="compact", regex="^(compact|full)$"),
     db: Session = Depends(get_db),
 ):
-    """
-    Build a full 15-man FPL-style squad in one shot.
+    season = get_current_season()
 
-    Rules:
-    - Total squad: 2 GKP / 5 DEF / 5 MID / 3 FWD (15)
-    - Starting XI (default): 3-4-3 (11)
-    - Budget: 100.0m
-    - Max 3 players per team
-    - Selection strategy:
-      1) Build starting XI using alternating cycles:
-         - cycle points: FWD -> MID -> DEF -> GKP
-         - cycle value : FWD -> MID -> DEF -> GKP
-      2) Fill bench to complete 15-man squad using value
-      3) Every pick runs feasibility checks to avoid dead-ends
-    """
     decided_gw, err = _decide_target_gw(db, target_gw)
     if err is not None:
-        return {"error": err}
+        return {"season": season, "error": err}
     assert decided_gw is not None
     target_gw = decided_gw
 
-    effective_status: Optional[str] = None if status == "all" else status
+    effective_status = None if status == "all" else status
 
-    # Pull candidate rows
     q = _base_candidates_query(
+        season=season,
         target_gw=target_gw,
         model_name=model_name,
         status=effective_status,
@@ -775,10 +705,8 @@ def recommend_squad(
     rows = db.execute(q).all()
     buckets = _build_candidate_buckets(rows)
 
-    # Diagnostics: how many candidates per position under filters
-    candidates_count = {p: len(buckets[p]) for p in buckets}
+    candidates_count = dict((p, len(buckets[p])) for p in buckets)
 
-    # Quick fail if impossible even by raw counts (without team cap/budget)
     missing_by_position = {}
     for pos, need in SQUAD_RULES.items():
         have = candidates_count.get(pos, 0)
@@ -786,6 +714,7 @@ def recommend_squad(
             missing_by_position[pos] = {"need": need, "have": have}
     if missing_by_position:
         return {
+            "season": season,
             "target_gw": target_gw,
             "model_name": model_name,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -806,7 +735,6 @@ def recommend_squad(
             },
         }
 
-    # 1) Build starting XI
     starting_rows, remaining_budget, team_counts, total_have, reasons1 = _pick_starting_xi(
         buckets=buckets,
         budget_m=budget_m,
@@ -815,8 +743,7 @@ def recommend_squad(
         starting_required=STARTING_FORMATION,
     )
 
-    # if starting not complete, fail (with helpful diag)
-    starting_have = {p: 0 for p in STARTING_FORMATION}
+    starting_have = dict((p, 0) for p in STARTING_FORMATION)
     for _, pl, _ in starting_rows:
         if pl.position in starting_have:
             starting_have[pl.position] += 1
@@ -824,6 +751,7 @@ def recommend_squad(
     if not starting_done:
         spent = budget_m - remaining_budget
         return {
+            "season": season,
             "target_gw": target_gw,
             "model_name": model_name,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -843,12 +771,11 @@ def recommend_squad(
                 "starting_have": starting_have,
                 "spent_m": round(spent, 1),
                 "remaining_m": round(remaining_budget, 1),
-                "team_counts": {str(k): v for k, v in team_counts.items()},
+                "team_counts": dict((str(k), v) for k, v in team_counts.items()),
                 "candidates_count": candidates_count,
             },
         }
 
-    # 2) Fill bench to complete squad
     bench_rows, remaining_budget2, reasons2 = _pick_bench(
         buckets=buckets,
         already_selected=starting_rows,
@@ -859,9 +786,8 @@ def recommend_squad(
         max_per_team=max_per_team,
     )
 
-    # Verify full 15-man squad
     final_rows = starting_rows + bench_rows
-    final_have = {p: 0 for p in SQUAD_RULES}
+    final_have = dict((p, 0) for p in SQUAD_RULES)
     for _, pl, _ in final_rows:
         if pl.position in final_have:
             final_have[pl.position] += 1
@@ -870,6 +796,7 @@ def recommend_squad(
     if not squad_done:
         spent = budget_m - remaining_budget2
         return {
+            "season": season,
             "target_gw": target_gw,
             "model_name": model_name,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -889,24 +816,19 @@ def recommend_squad(
                 "have_by_position": final_have,
                 "spent_m": round(spent, 1),
                 "remaining_m": round(remaining_budget2, 1),
-                "team_counts": {str(k): v for k, v in team_counts.items()},
+                "team_counts": dict((str(k), v) for k, v in team_counts.items()),
                 "candidates_count": candidates_count,
                 "hint": "Try relaxing filters (e.g., max_cost, min_predicted_points, or status=all).",
             },
         }
 
-    # Output serialization
-    if view == "compact":
-        serialize = _serialize_compact
-    else:
-        serialize = _serialize_full
+    serialize = _serialize_compact if view == "compact" else _serialize_full
 
     starting_grouped = _group_by_position(starting_rows)
     bench_grouped = _group_by_position(bench_rows)
 
     spent = budget_m - remaining_budget2
 
-    # 1) Build payload dicts first (so we can reuse them)
     starting_payload = {
         "GKP": [serialize(*r) for r in starting_grouped["GKP"]],
         "DEF": [serialize(*r) for r in starting_grouped["DEF"]],
@@ -921,7 +843,6 @@ def recommend_squad(
         "FWD": [serialize(*r) for r in bench_grouped["FWD"]],
     }
 
-    # 2) Helpers: flatten + bench_list (fixed 4)
     def _flatten_pos_dict(pos_dict: dict) -> list:
         out = []
         for pos in ["GKP", "DEF", "MID", "FWD"]:
@@ -929,19 +850,11 @@ def recommend_squad(
         return out
 
     def _build_bench_list(bench_dict: dict) -> list:
-        """
-        Fixed 4 bench players in order:
-        [bench_gkp, outfield1, outfield2, outfield3]
-        Outfield priority: DEF -> MID -> FWD
-        """
         bench_list_local = []
-
-        # bench GK
         gk = bench_dict.get("GKP", [])
         if gk:
             bench_list_local.append(gk[0])
 
-        # outfield priority
         outfield = []
         outfield.extend(bench_dict.get("DEF", []))
         outfield.extend(bench_dict.get("MID", []))
@@ -952,14 +865,12 @@ def recommend_squad(
         return bench_list_local
 
     bench_list = _build_bench_list(bench_payload)
-
-    # 3) Optional: squad_list (15 flat)
     starting_flat = _flatten_pos_dict(starting_payload)
 
     def _tag(items: list, role: str) -> list:
         tagged = []
         for i, x in enumerate(items, start=1):
-            y = dict(x)  # shallow copy
+            y = dict(x)
             y["role"] = role
             y["slot"] = i
             tagged.append(y)
@@ -968,6 +879,7 @@ def recommend_squad(
     squad_list = _tag(starting_flat, "starting") + _tag(bench_list, "bench")
 
     return {
+        "season": season,
         "target_gw": target_gw,
         "model_name": model_name,
         "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -984,15 +896,13 @@ def recommend_squad(
         "summary": {
             "spent_m": round(spent, 1),
             "remaining_m": round(remaining_budget2, 1),
-            "team_counts": {str(k): v for k, v in team_counts.items()},
+            "team_counts": dict((str(k), v) for k, v in team_counts.items()),
             "squad_counts": final_have,
         },
         "starting_xi": starting_payload,
         "bench": bench_payload,
-
-        # ✅ new
-        "bench_list": bench_list,   # fixed 4
-        "squad_list": squad_list,   # 15 flat
+        "bench_list": bench_list,
+        "squad_list": squad_list,
     }
 
 
@@ -1007,11 +917,14 @@ def recommend_transfers(
     req: TransferRecommendationsRequest,
     db: Session = Depends(get_db),
 ):
+    season = get_current_season()
+
     outgoing_stmt = (
         select(Prediction, Player, Team)
         .join(Player, Player.id == Prediction.player_id)
         .join(Team, Team.id == Player.team_id)
         .where(
+            Prediction.season == season,
             Prediction.target_gw == req.target_gw,
             Prediction.model_name == req.model_name,
             Prediction.player_id.in_(req.squad_player_ids),
@@ -1028,6 +941,7 @@ def recommend_transfers(
 
     if not outgoing_candidates:
         return {
+            "season": season,
             "target_gw": req.target_gw,
             "model_name": req.model_name,
             "bank": req.bank,
@@ -1049,6 +963,7 @@ def recommend_transfers(
         .join(Player, Player.id == Prediction.player_id)
         .join(Team, Team.id == Player.team_id)
         .where(
+            Prediction.season == season,
             Prediction.target_gw == req.target_gw,
             Prediction.model_name == req.model_name,
         )
@@ -1088,6 +1003,7 @@ def recommend_transfers(
             risk_flags.append("costs_minus_4")
 
         rows.append({
+            "season": season,
             "out_player_id": out["player_id"],
             "out_web_name": out["web_name"],
             "out_position": out["position"],
@@ -1116,6 +1032,7 @@ def recommend_transfers(
     )[: req.limit]
 
     return {
+        "season": season,
         "target_gw": req.target_gw,
         "model_name": req.model_name,
         "bank": req.bank,
@@ -1128,6 +1045,7 @@ def recommend_transfers(
         "rows": rows,
     }
 
+
 @router.get("/captain")
 def recommend_captain(
     target_gw: int,
@@ -1135,11 +1053,14 @@ def recommend_captain(
     limit: int = Query(default=5, ge=2, le=10),
     db: Session = Depends(get_db),
 ):
+    season = get_current_season()
+
     stmt = (
         select(Prediction, Player, Team)
         .join(Player, Player.id == Prediction.player_id)
         .join(Team, Team.id == Player.team_id)
         .where(
+            Prediction.season == season,
             Prediction.target_gw == target_gw,
             Prediction.model_name == model_name,
             Player.status == "a",
@@ -1156,6 +1077,7 @@ def recommend_captain(
 
         recent_stats = _get_recent_player_stats(
             db=db,
+            season=season,
             player_id=pl.id,
             target_gw=target_gw,
             window=5,
@@ -1169,6 +1091,7 @@ def recommend_captain(
         )
 
         top_candidates.append({
+            "season": season,
             "player_id": pl.id,
             "web_name": pl.web_name,
             "team_name": tm.name,
@@ -1179,7 +1102,12 @@ def recommend_captain(
             "captain_label": captain_label,
             "recent_form_summary": recent_form_summary,
             "minutes_stability": minutes_stability,
-            "explanation": f"Predicted {pts:.2f} points; {recent_form_summary}; minutes stability {minutes_stability['label']}; profile {captain_label}.",
+            "explanation": "Predicted %.2f points; %s; minutes stability %s; profile %s." % (
+                pts,
+                recent_form_summary,
+                minutes_stability["label"],
+                captain_label,
+            ),
             "future_factors": {
                 "fixture_difficulty": None,
                 "opponent_defense_strength": None,
@@ -1193,6 +1121,7 @@ def recommend_captain(
     vice_captain = top_candidates[1] if len(top_candidates) >= 2 else None
 
     return {
+        "season": season,
         "target_gw": target_gw,
         "model_name": model_name,
         "captain": captain,

@@ -1,15 +1,12 @@
 from __future__ import annotations
 
 from collections import defaultdict
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
+from app.core.season import get_current_season
 from app.schemas.free_hit import FreeHitPlayer, FreeHitRejectedCandidate
 from app.schemas.wildcard import WildcardBuildResponse
 from app.utils.wildcard_horizon import build_wildcard_horizon_snapshot
-from app.schemas.wildcard import (
-    WildcardBuildResponse,
-    WildcardPriorityTransfer,
-)
 from app.utils.wildcard_transfer_summary import build_priority_transfers_from_current_squad
 
 SQUAD_RULES = {"GKP": 2, "DEF": 5, "MID": 5, "FWD": 3}
@@ -75,7 +72,7 @@ def _count_positions(players: List[FreeHitPlayer]) -> Dict[str, int]:
 def _min_cost_needed_for_remaining(
     *,
     buckets: Dict[str, List[dict]],
-    selected_ids: set[int],
+    selected_ids: Set[int],
     team_counts: Dict[int, int],
     need_by_pos: Dict[str, int],
     max_per_team: int = 3,
@@ -108,14 +105,14 @@ def _try_add_player(
     row: dict,
     buckets: Dict[str, List[dict]],
     selected_rows: List[dict],
-    selected_ids: set[int],
+    selected_ids: Set[int],
     team_counts: Dict[int, int],
     pos_counts: Dict[str, int],
     budget_tenths: int,
     spent_tenths: int,
     rejected_candidates: List[FreeHitRejectedCandidate],
     max_rejected: int = 40,
-) -> tuple[bool, int]:
+) -> Tuple[bool, int]:
     pos = row["position"]
     cost = int(row["now_cost"])
     team_id = int(row["team_id"])
@@ -144,10 +141,7 @@ def _try_add_player(
     team_counts[team_id] = team_counts.get(team_id, 0) + 1
     pos_counts[pos] += 1
 
-    need_by_pos = {
-        p: SQUAD_RULES[p] - pos_counts[p]
-        for p in SQUAD_RULES
-    }
+    need_by_pos = {p: SQUAD_RULES[p] - pos_counts[p] for p in SQUAD_RULES}
     min_remaining = _min_cost_needed_for_remaining(
         buckets=buckets,
         selected_ids=selected_ids,
@@ -175,7 +169,7 @@ def _try_add_player(
 
 def _build_starting_and_bench(
     squad_players: List[FreeHitPlayer],
-) -> tuple[List[FreeHitPlayer], List[FreeHitPlayer]]:
+) -> Tuple[List[FreeHitPlayer], List[FreeHitPlayer]]:
     by_pos: Dict[str, List[FreeHitPlayer]] = defaultdict(list)
     for p in squad_players:
         by_pos[p.position].append(p)
@@ -215,32 +209,6 @@ def _build_starting_and_bench(
     return starting_xi, bench
 
 
-def _choose_captains(starting_xi: List[FreeHitPlayer]) -> Tuple[Optional[FreeHitPlayer], Optional[FreeHitPlayer]]:
-    ordered = sorted(
-        starting_xi,
-        key=lambda x: (x.predicted_points, -x.now_cost, -x.player_id),
-        reverse=True,
-    )
-    captain = ordered[0] if len(ordered) >= 1 else None
-    vice_captain = ordered[1] if len(ordered) >= 2 else None
-    return captain, vice_captain
-
-def _build_first_gw_points_map(
-    horizon_rows: List[dict],
-    target_gw: int,
-) -> Dict[int, float]:
-    out: Dict[int, float] = {}
-    for row in horizon_rows:
-        player_id = int(row["player_id"])
-        first_gw_pts = 0.0
-        for pred in row.get("gw_predictions", []):
-            if int(pred["target_gw"]) == target_gw:
-                first_gw_pts = float(pred["predicted_points"])
-                break
-        out[player_id] = first_gw_pts
-    return out
-
-
 def _choose_captains_for_first_gw(
     starting_xi: List[FreeHitPlayer],
     first_gw_points_map: Dict[int, float],
@@ -259,12 +227,29 @@ def _choose_captains_for_first_gw(
     vice_captain = ordered[1] if len(ordered) >= 2 else None
     return captain, vice_captain
 
+
+def _build_first_gw_points_map(
+    horizon_rows: List[dict],
+    target_gw: int,
+) -> Dict[int, float]:
+    out: Dict[int, float] = {}
+    for row in horizon_rows:
+        player_id = int(row["player_id"])
+        first_gw_pts = 0.0
+        for pred in row.get("gw_predictions", []):
+            if int(pred["target_gw"]) == target_gw:
+                first_gw_pts = float(pred["predicted_points"])
+                break
+        out[player_id] = first_gw_pts
+    return out
+
+
 def _validate_wildcard_result(
     *,
     starting_xi: List[FreeHitPlayer],
     bench: List[FreeHitPlayer],
     captain: Optional[FreeHitPlayer],
-    vice_captain: Optional[FreeHitPlayer],  
+    vice_captain: Optional[FreeHitPlayer],
     locked_player_ids: List[int],
     budget: float,
     spent_m: float,
@@ -337,17 +322,25 @@ def build_wildcard_squad_v1(
     model_name: str,
     locked_player_ids: List[int],
     current_squad_player_ids: List[int],
+    season: Optional[str] = None,
 ) -> WildcardBuildResponse:
+    resolved_season = season or get_current_season()
+
     snapshot = build_wildcard_horizon_snapshot(
         db=db,
         start_gw=target_gw,
         horizon=horizon,
         model_name=model_name,
+        season=resolved_season,
     )
 
     all_rows = snapshot["player_features"]
     if not all_rows:
-        raise ValueError("No horizon player features found.")
+        raise ValueError(
+            "No horizon player features found "
+            f"for season={resolved_season}, target_gw={target_gw}, "
+            f"horizon={horizon}, model_name={model_name}."
+        )
 
     budget_tenths = int(round(budget * 10))
     buckets = _group_by_position(all_rows)
@@ -355,17 +348,21 @@ def build_wildcard_squad_v1(
     row_by_player_id = {row["player_id"]: row for row in all_rows}
 
     selected_rows: List[dict] = []
-    selected_ids: set[int] = set()
+    selected_ids: Set[int] = set()
     team_counts: Dict[int, int] = {}
     pos_counts: Dict[str, int] = {"GKP": 0, "DEF": 0, "MID": 0, "FWD": 0}
     rejected_candidates: List[FreeHitRejectedCandidate] = []
     spent_tenths = 0
 
-    # lock required players
+    # Lock required players.
     for player_id in locked_player_ids:
         row = row_by_player_id.get(player_id)
         if row is None:
-            raise ValueError(f"Locked player_id={player_id} not found in wildcard horizon candidate pool.")
+            raise ValueError(
+                f"Locked player_id={player_id} not found in wildcard horizon candidate pool "
+                f"for season={resolved_season}, target_gw={target_gw}, "
+                f"horizon={horizon}, model_name={model_name}."
+            )
         ok, spent_tenths = _try_add_player(
             row=row,
             buckets=buckets,
@@ -378,9 +375,12 @@ def build_wildcard_squad_v1(
             rejected_candidates=rejected_candidates,
         )
         if not ok:
-            raise ValueError(f"Locked player_id={player_id} makes the wildcard squad infeasible.")
+            raise ValueError(
+                f"Locked player_id={player_id} makes the wildcard squad infeasible "
+                f"for season={resolved_season}, target_gw={target_gw}, budget={budget}."
+            )
 
-    # greedily complete squad by position
+    # Greedily complete squad by position.
     for pos in POSITION_ORDER:
         while pos_counts[pos] < SQUAD_RULES[pos]:
             added = False
@@ -400,7 +400,11 @@ def build_wildcard_squad_v1(
                     added = True
                     break
             if not added:
-                raise ValueError(f"Failed to complete wildcard squad for position {pos}.")
+                raise ValueError(
+                    f"Failed to complete wildcard squad for position={pos}, "
+                    f"season={resolved_season}, target_gw={target_gw}, "
+                    f"horizon={horizon}, model_name={model_name}, budget={budget}."
+                )
 
     all_players = [_serialize_horizon_player(row) for row in selected_rows]
     all_players = sorted(
@@ -417,10 +421,10 @@ def build_wildcard_squad_v1(
     projected_points_starting_xi_horizon = sum(p.predicted_points for p in starting_xi)
     projected_points_total_15_horizon = sum(p.predicted_points for p in all_players)
     priority_transfers_from_current_squad = build_priority_transfers_from_current_squad(
-    current_squad_player_ids=current_squad_player_ids,
-    wildcard_players=all_players,
-    horizon_rows=all_rows,
-)
+        current_squad_player_ids=current_squad_player_ids,
+        wildcard_players=all_players,
+        horizon_rows=all_rows,
+    )
 
     validation_errors = _validate_wildcard_result(
         starting_xi=starting_xi,
@@ -432,26 +436,32 @@ def build_wildcard_squad_v1(
         spent_m=spent_m,
     )
     if validation_errors:
-        raise ValueError(f"Built invalid wildcard squad: {validation_errors}")
+        raise ValueError(
+            f"Built invalid wildcard squad for season={resolved_season}, "
+            f"target_gw={target_gw}, model_name={model_name}: {validation_errors}"
+        )
 
     return WildcardBuildResponse(
-    target_gw=target_gw,
-    horizon=horizon,
-    budget=budget,
-    model_name=model_name,
-    locked_player_ids=locked_player_ids,
-    current_squad_player_ids=current_squad_player_ids,
-    scoring_objective="maximize_horizon_predicted_points_only",
-    starting_xi=starting_xi,
-    bench=bench,
-    captain=captain,
-    vice_captain=vice_captain,
-    captain_selection_target_gw=target_gw,
-    spent_m=round(spent_m, 1),
-    remaining_m=round(remaining_m, 1),
-    projected_points_starting_xi_horizon=round(projected_points_starting_xi_horizon, 2),
-    projected_points_total_15_horizon=round(projected_points_total_15_horizon, 2),
-    priority_transfers_from_current_squad=priority_transfers_from_current_squad,
-    rejected_candidates=rejected_candidates,
-    notes="Wildcard generator v1 using Day45 horizon features with deterministic greedy construction.",
-)
+        target_gw=target_gw,
+        horizon=horizon,
+        budget=budget,
+        model_name=model_name,
+        locked_player_ids=locked_player_ids,
+        current_squad_player_ids=current_squad_player_ids,
+        scoring_objective="maximize_horizon_predicted_points_only",
+        starting_xi=starting_xi,
+        bench=bench,
+        captain=captain,
+        vice_captain=vice_captain,
+        captain_selection_target_gw=target_gw,
+        spent_m=round(spent_m, 1),
+        remaining_m=round(remaining_m, 1),
+        projected_points_starting_xi_horizon=round(projected_points_starting_xi_horizon, 2),
+        projected_points_total_15_horizon=round(projected_points_total_15_horizon, 2),
+        priority_transfers_from_current_squad=priority_transfers_from_current_squad,
+        rejected_candidates=rejected_candidates,
+        notes=(
+            "Wildcard generator v1 using Day45 horizon features with deterministic greedy construction. "
+            f"Season scope: {resolved_season}."
+        ),
+    )
