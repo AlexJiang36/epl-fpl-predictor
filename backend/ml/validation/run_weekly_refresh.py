@@ -248,6 +248,7 @@ def run_validation_step(
         target_gw=target_gw,
         model_name=model_name,
         require_prediction_count_check=require_prediction_count_check,
+        season=season,
     )
     if not report["overall_passed"]:
         raise RuntimeError(
