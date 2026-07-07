@@ -217,3 +217,10 @@ docs/wildcard_horizon_assumptions.md
 backend/docs/
 docs/examples/day48_refresh_check_report.json
 docs/run_snapshots_auditability.md
+
+# Internal planning / handoff docs
+docs/internal/
+
+# Internal planning / generated docs
+docs/internal/
+backend/ml/validation/write_historical_import_contract.py
