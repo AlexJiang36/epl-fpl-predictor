@@ -191,8 +191,8 @@ def build_default_player_commands(
     ridge_alpha: float,
 ) -> List[str]:
     commands = [
-        "python -m ml.predict.run_baseline_rollavg_v0 --target-gw {target_gw} --window 5",
-        "python -m ml.predict.run_baseline_rollavg_v1 --target-gw {target_gw}",
+        "python -m ml.predict.run_baseline_rollavg_v0 --season {season} --target-gw {target_gw} --window 5",
+        "python -m ml.predict.run_baseline_rollavg_v1 --season {season} --target-gw {target_gw}",
     ]
 
     if include_ridge_next_gw:
@@ -209,7 +209,7 @@ def build_default_player_commands(
             )
         commands.append(
             "python -m ml.predict.predict_next_gw_ridge_rollform_v1 "
-            f"--last_gw {{last_actual_gw}} --split_gw {ridge_split_gw} --alpha {ridge_alpha}"
+            f"--target-season {{season}} --train-seasons {{season}} --last-gw {{last_actual_gw}} --split-gw {ridge_split_gw} --alpha {ridge_alpha}"
         )
 
     return commands
