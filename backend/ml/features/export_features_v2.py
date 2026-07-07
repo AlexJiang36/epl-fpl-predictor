@@ -1,18 +1,25 @@
 import os
+from typing import Optional
+
 import pandas as pd
 from sqlalchemy import create_engine, text
 
 from app.core.season import get_current_season
 
 
-def export_features_v2(start_gw: int, end_gw: int, out_csv: str) -> None:
+def export_features_v2(
+    start_gw: int,
+    end_gw: int,
+    out_csv: str,
+    season: Optional[str] = None,
+) -> None:
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
         raise RuntimeError(
             'DATABASE_URL is not set. Example: export DATABASE_URL="postgresql://app:app@localhost:5432/epl"'
         )
 
-    season = get_current_season()
+    resolved_season = season or get_current_season()
     engine = create_engine(db_url)
 
     with engine.begin() as conn:
@@ -39,12 +46,12 @@ def export_features_v2(start_gw: int, end_gw: int, out_csv: str) -> None:
                 """
             ),
             conn,
-            params={"season": season, "start_gw": start_gw, "end_gw": end_gw},
+            params={"season": resolved_season, "start_gw": start_gw, "end_gw": end_gw},
         )
 
         if df.empty:
             raise RuntimeError(
-                f"No rows found in player_gw_stats for season={season} gw range [{start_gw}, {end_gw}]"
+                f"No rows found in player_gw_stats for season={resolved_season} gw range [{start_gw}, {end_gw}]"
             )
 
         team_fixture = pd.read_sql(
@@ -93,7 +100,7 @@ def export_features_v2(start_gw: int, end_gw: int, out_csv: str) -> None:
                 """
             ),
             conn,
-            params={"season": season, "end_gw": end_gw},
+            params={"season": resolved_season, "end_gw": end_gw},
         )
 
     g = df.groupby("player_id", group_keys=False)
@@ -297,21 +304,23 @@ def export_features_v2(start_gw: int, end_gw: int, out_csv: str) -> None:
     df = df.dropna(subset=["pts_last1", "mins_last1"]).reset_index(drop=True)
 
     df = pd.get_dummies(df, columns=["position", "status"], drop_first=False)
+    df["season"] = resolved_season
 
     df.to_csv(out_csv, index=False)
-    print(f"OK: wrote {len(df)} rows -> {out_csv}")
+    print(f"OK: season={resolved_season} wrote {len(df)} rows -> {out_csv}")
 
 
 def main():
     import argparse
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--start_gw", type=int, required=True)
-    ap.add_argument("--end_gw", type=int, required=True)
+    ap.add_argument("--start_gw", "--start-gw", dest="start_gw", type=int, required=True)
+    ap.add_argument("--end_gw", "--end-gw", dest="end_gw", type=int, required=True)
+    ap.add_argument("--season", type=str, default=None)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
-    export_features_v2(args.start_gw, args.end_gw, args.out)
+    export_features_v2(args.start_gw, args.end_gw, args.out, season=args.season)
 
 
 if __name__ == "__main__":

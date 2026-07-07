@@ -1,6 +1,6 @@
-
 import argparse
 import json
+import os
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -16,6 +16,8 @@ EXPORT_MODULE_BY_FEATURE_VERSION = {
     "v0": "ml.features.export_match_dataset_v0",
     "v2": "ml.features.export_match_dataset_v2",
 }
+
+EXPLICIT_SEASON_EXPORT_FEATURE_VERSIONS = {"v2"}
 
 
 def utc_stamp() -> str:
@@ -91,10 +93,16 @@ def main() -> None:
     ap.add_argument("--model-name", required=True)
     ap.add_argument("--n-form", type=int, default=5)
     ap.add_argument("--n-h2h", type=int, default=3)
+    ap.add_argument(
+        "--season",
+        type=str,
+        default=None,
+        help="Season key, for example 2025_26. Defaults to app.core.season.get_current_season().",
+    )
     ap.add_argument("--out-csv", default=None)
     args = ap.parse_args()
 
-    season = get_current_season()
+    season = args.season or get_current_season()
     out_csv = args.out_csv or default_match_csv_path(
         season=season,
         gw_start=args.gw_start,
@@ -122,12 +130,18 @@ def main() -> None:
     if args.feature_version == "v2":
         export_cmd.extend(["--n_h2h", str(args.n_h2h)])
 
-    subprocess.run(export_cmd, check=True)
+    if args.feature_version in EXPLICIT_SEASON_EXPORT_FEATURE_VERSIONS:
+        export_cmd.extend(["--season", season])
+
+    child_env = os.environ.copy()
+    child_env["FPL_SEASON"] = season
+
+    subprocess.run(export_cmd, check=True, env=child_env)
 
     row_count = count_rows(out_csv)
 
     short_id = uuid4().hex[:8]
-    snapshot_id = f"match_features_{utc_stamp()}_{short_id}"
+    snapshot_id = f"match_features_{season}_{utc_stamp()}_{short_id}"
     metadata = build_metadata(
         snapshot_id=snapshot_id,
         season=season,
@@ -147,6 +161,7 @@ def main() -> None:
     with open(metadata_path, "w", encoding="utf-8") as f:
         json.dump(metadata, f, ensure_ascii=False, indent=2)
 
+    print(f"season: {season}")
     print(f"exported_csv: {out_csv}")
     print(f"row_count: {row_count}")
     print(f"saved_metadata: {metadata_path}")

@@ -1,5 +1,7 @@
 
 import os
+from typing import Optional
+
 import pandas as pd
 from sqlalchemy import create_engine, text
 
@@ -154,12 +156,19 @@ def _compute_h2h_features(fixtures_history: pd.DataFrame, target_fixtures: pd.Da
     return pd.DataFrame(rows)
 
 
-def export_match_dataset_v2(start_gw: int, end_gw: int, n_form: int, out_csv: str, n_h2h: int = 3) -> None:
+def export_match_dataset_v2(
+    start_gw: int,
+    end_gw: int,
+    n_form: int,
+    out_csv: str,
+    n_h2h: int = 3,
+    season: Optional[str] = None,
+) -> None:
     db_url = os.environ.get("DATABASE_URL")
     if not db_url:
         raise RuntimeError('DATABASE_URL is not set. Example: export DATABASE_URL="postgresql://app:app@localhost:5432/epl"')
 
-    season = get_current_season()
+    resolved_season = season or get_current_season()
     engine = create_engine(db_url)
 
     with engine.begin() as conn:
@@ -185,12 +194,12 @@ def export_match_dataset_v2(start_gw: int, end_gw: int, n_form: int, out_csv: st
                 """
             ),
             conn,
-            params={"season": season, "start_gw": start_gw, "end_gw": end_gw},
+            params={"season": resolved_season, "start_gw": start_gw, "end_gw": end_gw},
         )
 
         if target_fixtures.empty:
             raise RuntimeError(
-                f"No finished fixtures found in season={season} gw range [{start_gw}, {end_gw}]"
+                f"No finished fixtures found in season={resolved_season} gw range [{start_gw}, {end_gw}]"
             )
 
         history_fixtures = pd.read_sql(
@@ -215,7 +224,7 @@ def export_match_dataset_v2(start_gw: int, end_gw: int, n_form: int, out_csv: st
                 """
             ),
             conn,
-            params={"season": season, "end_gw": end_gw},
+            params={"season": resolved_season, "end_gw": end_gw},
         )
 
     target_fixtures["kickoff_time"] = pd.to_datetime(target_fixtures["kickoff_time"], utc=True)
@@ -363,7 +372,10 @@ def export_match_dataset_v2(start_gw: int, end_gw: int, n_form: int, out_csv: st
     h2h = _compute_h2h_features(history_fixtures, target_fixtures, n_h2h=n_h2h)
     out = out.merge(h2h, on="fixture_id", how="left")
 
+    out["season"] = resolved_season
+
     cols = [
+        "season",
         "fixture_id",
         "gw",
         "kickoff_time",
@@ -407,17 +419,18 @@ def export_match_dataset_v2(start_gw: int, end_gw: int, n_form: int, out_csv: st
 
     out = out[cols].copy()
     out.to_csv(out_csv, index=False)
-    print(f"OK: wrote {len(out)} rows -> {out_csv}")
+    print(f"OK: season={resolved_season} wrote {len(out)} rows -> {out_csv}")
 
 
 def main():
     import argparse
 
     ap = argparse.ArgumentParser()
-    ap.add_argument("--start_gw", type=int, required=True)
-    ap.add_argument("--end_gw", type=int, required=True)
-    ap.add_argument("--n_form", type=int, default=5)
-    ap.add_argument("--n_h2h", type=int, default=3)
+    ap.add_argument("--start_gw", "--start-gw", dest="start_gw", type=int, required=True)
+    ap.add_argument("--end_gw", "--end-gw", dest="end_gw", type=int, required=True)
+    ap.add_argument("--n_form", "--n-form", dest="n_form", type=int, default=5)
+    ap.add_argument("--n_h2h", "--n-h2h", dest="n_h2h", type=int, default=3)
+    ap.add_argument("--season", type=str, default=None)
     ap.add_argument("--out", required=True)
     args = ap.parse_args()
 
@@ -427,6 +440,7 @@ def main():
         n_form=args.n_form,
         out_csv=args.out,
         n_h2h=args.n_h2h,
+        season=args.season,
     )
 
 

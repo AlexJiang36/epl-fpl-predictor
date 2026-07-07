@@ -5,15 +5,12 @@ import csv
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List
 
 from sqlalchemy import text
 
 from app.core.db import SessionLocal
 from app.core.season import get_current_season
-
-
-DEFAULT_SOURCE_SEASON = "2024_25"
 
 
 def parse_args() -> argparse.Namespace:
@@ -26,7 +23,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--source-season",
         type=str,
-        default=DEFAULT_SOURCE_SEASON,
+        required=True,
         help="Season used to compute priors, for example 2024_25.",
     )
     parser.add_argument(
