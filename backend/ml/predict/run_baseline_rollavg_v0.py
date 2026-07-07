@@ -1,5 +1,7 @@
+import argparse
 import json
 import os
+from typing import Optional, Tuple
 
 import pandas as pd
 from sqlalchemy import create_engine, text
@@ -51,7 +53,7 @@ def make_features(df: pd.DataFrame) -> pd.DataFrame:
     return df
 
 
-def write_predictions(conn, season: str, out_df: pd.DataFrame, target_gw: int) -> tuple[int, int]:
+def write_predictions(conn, season: str, out_df: pd.DataFrame, target_gw: int) -> Tuple[int, int]:
     existing_ids = {
         row[0]
         for row in conn.execute(
@@ -109,21 +111,21 @@ def write_predictions(conn, season: str, out_df: pd.DataFrame, target_gw: int) -
     return inserted, updated
 
 
-def main(target_gw: int, window: int = 5) -> None:
+def main(target_gw: int, window: int = 5, season: Optional[str] = None) -> None:
     db_url = os.environ["DATABASE_URL"]
-    season = get_current_season()
+    resolved_season = season or get_current_season()
 
     engine = create_engine(db_url)
 
     with engine.begin() as conn:
-        raw = load_raw_df(conn, season=season, gw_max=target_gw - 1)
+        raw = load_raw_df(conn, season=resolved_season, gw_max=target_gw - 1)
         if raw.empty:
-            raise RuntimeError(f"No rows found for season={season} up to gw={target_gw - 1}")
+            raise RuntimeError(f"No rows found for season={resolved_season} up to gw={target_gw - 1}")
 
         feature_df = make_features(raw)
         if feature_df.empty:
             raise RuntimeError(
-                f"No rows left after feature construction for season={season}, target_gw={target_gw}"
+                f"No rows left after feature construction for season={resolved_season}, target_gw={target_gw}"
             )
 
         last_finished_gws = sorted(feature_df["gw"].dropna().astype(int).unique().tolist())
@@ -136,12 +138,17 @@ def main(target_gw: int, window: int = 5) -> None:
             .rename(columns={"total_points": "predicted_points"})
         )
 
-        inserted, updated = write_predictions(conn, season=season, out_df=pred_df, target_gw=target_gw)
+        inserted, updated = write_predictions(
+            conn,
+            season=resolved_season,
+            out_df=pred_df,
+            target_gw=target_gw,
+        )
 
     print(
         json.dumps(
             {
-                "season": season,
+                "season": resolved_season,
                 "target_gw": target_gw,
                 "window": window,
                 "used_finished_gws": used_finished_gws,
@@ -156,11 +163,15 @@ def main(target_gw: int, window: int = 5) -> None:
 
 
 if __name__ == "__main__":
-    import argparse
-
     ap = argparse.ArgumentParser()
     ap.add_argument("--target-gw", type=int, required=True)
     ap.add_argument("--window", type=int, default=5)
+    ap.add_argument(
+        "--season",
+        type=str,
+        default=None,
+        help="Season key, for example 2025_26. Defaults to app.core.season.get_current_season().",
+    )
     args = ap.parse_args()
 
-    main(target_gw=args.target_gw, window=args.window)
+    main(target_gw=args.target_gw, window=args.window, season=args.season)
