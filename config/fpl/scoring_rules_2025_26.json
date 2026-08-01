@@ -1,0 +1,270 @@
+{
+  "schema_version": "fpl_scoring_rules_v1",
+  "competition": "FPL",
+  "effective_season": "2025_26",
+  "rules_version": "fpl_2025_26_scoring_v1",
+  "status": "target_season_registry_validated_for_rule_loading",
+  "source_notes": [
+    {
+      "title": "FPL basics explained: Scoring points",
+      "publisher": "Premier League",
+      "purpose": "Core points table, clean-sheet behavior, bonus allocation, and defensive-contribution thresholds.",
+      "url": "https://www.premierleague.com/en/news/2174909"
+    },
+    {
+      "title": "What's new in 2025/26 Fantasy: Defensive contributions",
+      "publisher": "Premier League",
+      "purpose": "2025/26 CBIT and CBIRT thresholds and the two-point match cap.",
+      "url": "https://www.premierleague.com/en/news/4361991/"
+    },
+    {
+      "title": "What's new in 2025/26 Fantasy: Changes to assists rules",
+      "publisher": "Premier League",
+      "purpose": "2025/26 assist-definition change; the points value remains three.",
+      "url": "https://www.premierleague.com/en/news/4362187"
+    },
+    {
+      "title": "What's new in 2025/26 Fantasy: Changes to Bonus Points System",
+      "publisher": "Premier League",
+      "purpose": "2025/26 BPS context. This registry stores awarded FPL bonus points, not a full event-level BPS calculator.",
+      "url": "https://www.premierleague.com/en/news/4362127/whats-new-in-202526-fantasy-changes-to-bonus-points-system"
+    }
+  ],
+  "positions": [
+    "GKP",
+    "DEF",
+    "MID",
+    "FWD"
+  ],
+  "scoring": {
+    "appearance": {
+      "minutes_basis": "completed_minutes_excluding_stoppage_time",
+      "bands": [
+        {
+          "min_minutes": 1,
+          "max_minutes": 59,
+          "points": 1
+        },
+        {
+          "min_minutes": 60,
+          "max_minutes": null,
+          "points": 2
+        }
+      ]
+    },
+    "goals": {
+      "points_by_position": {
+        "GKP": 10,
+        "DEF": 6,
+        "MID": 5,
+        "FWD": 4
+      }
+    },
+    "assists": {
+      "points": 3,
+      "definition_version": "fpl_2025_26_simplified_assist_definition",
+      "notes": [
+        "Awarding the assist event is an upstream event-classification concern.",
+        "This scoring registry converts each awarded assist into three points."
+      ]
+    },
+    "clean_sheets": {
+      "minimum_minutes": 60,
+      "minutes_basis": "completed_minutes_excluding_stoppage_time",
+      "concession_scope": "goals_conceded_while_player_on_pitch",
+      "substituted_before_later_concession_keeps_points": true,
+      "points_by_position": {
+        "GKP": 4,
+        "DEF": 4,
+        "MID": 1,
+        "FWD": 0
+      }
+    },
+    "saves": {
+      "per_saves": 3,
+      "points": 1,
+      "uncapped": true,
+      "eligibility": "player_acting_as_goalkeeper"
+    },
+    "penalty_saves": {
+      "points": 5,
+      "eligibility": "player_acting_as_goalkeeper"
+    },
+    "cards": {
+      "yellow_points": -1,
+      "red_points": -3,
+      "red_points_include_yellow_deductions": true,
+      "red_card_player_continues_to_be_charged_for_applicable_goals_conceded": true
+    },
+    "own_goals": {
+      "points": -2
+    },
+    "penalty_misses": {
+      "points": -2
+    },
+    "goals_conceded": {
+      "eligible_positions": [
+        "GKP",
+        "DEF"
+      ],
+      "per_goals": 2,
+      "points": -1,
+      "input_semantics": "goals_conceded_for_scoring_after_applying_on_pitch_and_red_card_rules"
+    },
+    "bonus": {
+      "allowed_player_points": [
+        0,
+        1,
+        2,
+        3
+      ],
+      "rank_points": {
+        "1": 3,
+        "2": 2,
+        "3": 1
+      },
+      "tie_policy": [
+        "Tie for first: tied first-place players receive 3 each; next eligible rank receives 1.",
+        "Tie for second: first receives 3; tied second-place players receive 2 each.",
+        "Tie for third: first receives 3; second receives 2; tied third-place players receive 1 each."
+      ],
+      "scope": "awarded_fpl_bonus_points_only",
+      "full_bps_event_calculator_included": false
+    },
+    "defensive_contributions": {
+      "introduced_for_effective_season": "2025_26",
+      "by_position": {
+        "GKP": {
+          "threshold": null,
+          "metrics": [],
+          "points": 0,
+          "max_points_per_match": 0
+        },
+        "DEF": {
+          "threshold": 10,
+          "metrics": [
+            "clearances",
+            "blocks",
+            "interceptions",
+            "tackles"
+          ],
+          "aggregate_label": "CBIT",
+          "points": 2,
+          "max_points_per_match": 2
+        },
+        "MID": {
+          "threshold": 12,
+          "metrics": [
+            "clearances",
+            "blocks",
+            "interceptions",
+            "tackles",
+            "ball_recoveries"
+          ],
+          "aggregate_label": "CBIRT",
+          "points": 2,
+          "max_points_per_match": 2
+        },
+        "FWD": {
+          "threshold": 12,
+          "metrics": [
+            "clearances",
+            "blocks",
+            "interceptions",
+            "tackles",
+            "ball_recoveries"
+          ],
+          "aggregate_label": "CBIRT",
+          "points": 2,
+          "max_points_per_match": 2
+        }
+      }
+    }
+  },
+  "deterministic_examples": [
+    {
+      "id": "gkp_goal_save_penalty_save_example",
+      "position": "GKP",
+      "events": {
+        "minutes": 90,
+        "goals": 1,
+        "assists": 0,
+        "clean_sheet": false,
+        "saves": 6,
+        "penalty_saves": 1,
+        "yellow_cards": 1,
+        "red_cards": 0,
+        "own_goals": 0,
+        "penalty_misses": 0,
+        "goals_conceded_for_scoring": 2,
+        "bonus_points": 3,
+        "defensive_contributions": 0,
+        "acted_as_goalkeeper": true
+      },
+      "expected_total_points": 20
+    },
+    {
+      "id": "def_goal_assist_clean_sheet_dc_example",
+      "position": "DEF",
+      "events": {
+        "minutes": 90,
+        "goals": 1,
+        "assists": 1,
+        "clean_sheet": true,
+        "saves": 0,
+        "penalty_saves": 0,
+        "yellow_cards": 1,
+        "red_cards": 0,
+        "own_goals": 0,
+        "penalty_misses": 0,
+        "goals_conceded_for_scoring": 0,
+        "bonus_points": 2,
+        "defensive_contributions": 10,
+        "acted_as_goalkeeper": false
+      },
+      "expected_total_points": 18
+    },
+    {
+      "id": "mid_goal_assist_clean_sheet_penalty_miss_dc_example",
+      "position": "MID",
+      "events": {
+        "minutes": 75,
+        "goals": 1,
+        "assists": 1,
+        "clean_sheet": true,
+        "saves": 0,
+        "penalty_saves": 0,
+        "yellow_cards": 0,
+        "red_cards": 0,
+        "own_goals": 0,
+        "penalty_misses": 1,
+        "goals_conceded_for_scoring": 0,
+        "bonus_points": 1,
+        "defensive_contributions": 12,
+        "acted_as_goalkeeper": false
+      },
+      "expected_total_points": 12
+    },
+    {
+      "id": "fwd_substitute_two_goals_red_own_goal_dc_example",
+      "position": "FWD",
+      "events": {
+        "minutes": 30,
+        "goals": 2,
+        "assists": 1,
+        "clean_sheet": false,
+        "saves": 0,
+        "penalty_saves": 0,
+        "yellow_cards": 1,
+        "red_cards": 1,
+        "own_goals": 1,
+        "penalty_misses": 0,
+        "goals_conceded_for_scoring": 0,
+        "bonus_points": 0,
+        "defensive_contributions": 12,
+        "acted_as_goalkeeper": false
+      },
+      "expected_total_points": 9
+    }
+  ]
+}
