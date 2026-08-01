@@ -15,6 +15,7 @@ from app.core.db import SessionLocal
 
 
 POSITION_NAME_BY_ID = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
+IDENTITY_POLICY_VERSION = "day66b_identity_continuity_v2"
 
 
 def parse_args() -> argparse.Namespace:
@@ -491,26 +492,40 @@ def score_candidate(hrow: pd.Series, trow: pd.Series, raw_to_canonical_team: Dic
 
     hist_position = normalize_position(hrow.get("raw_position"))
     target_position = normalize_position(trow.get("candidate_position"))
-    position_match = hist_position is not None and target_position is not None and hist_position == target_position
+    position_known = hist_position is not None and target_position is not None
+    position_match = position_known and hist_position == target_position
 
     raw_team_id = normalize_raw_id(hrow.get("raw_team_id"))
     mapped_team_id = raw_to_canonical_team.get(raw_team_id)
     target_team_id = nullable_int(trow.get("candidate_team_id"))
-    team_match = mapped_team_id is not None and target_team_id is not None and int(mapped_team_id) == int(target_team_id)
+    team_known = mapped_team_id is not None and target_team_id is not None
+    team_match = team_known and int(mapped_team_id) == int(target_team_id)
 
     score = name_score * 0.82
     if position_match:
         score += 0.12
-    elif hist_position is not None and target_position is not None:
+    elif position_known:
         score -= 0.10
     if team_match:
         score += 0.06
 
     hist_initial = historical_initial_surname(hrow.get("raw_player_name"))
-    target_initial = initial_surname_variant(trow.get("candidate_first_name"), trow.get("candidate_second_name"))
-    exact_initial_surname_match = bool(hist_initial and target_initial and hist_initial == target_initial)
+    target_initial = initial_surname_variant(
+        trow.get("candidate_first_name"),
+        trow.get("candidate_second_name"),
+    )
+    exact_initial_surname_match = bool(
+        hist_initial
+        and target_initial
+        and hist_initial == target_initial
+    )
 
-    exact_variant_match = bool(best_hist_name and best_target_name and best_hist_name == best_target_name and len(best_hist_name) >= 4)
+    exact_variant_match = bool(
+        best_hist_name
+        and best_target_name
+        and best_hist_name == best_target_name
+        and len(best_hist_name) >= 4
+    )
 
     if exact_initial_surname_match:
         score = max(score, 0.98 if position_match else 0.92)
@@ -521,29 +536,106 @@ def score_candidate(hrow: pd.Series, trow: pd.Series, raw_to_canonical_team: Dic
             name_match_type = "exact_name_or_web_with_position"
 
     name_safety = safe_name_match_details(hrow, trow)
+    exact_web_name_match = bool(name_safety["exact_web_name_match"])
+    exact_full_name_match = bool(name_safety["exact_full_name_match"])
+    exact_initial_surname_match = bool(
+        name_safety["exact_initial_surname_match"]
+    )
+    safe_name_match = bool(
+        name_safety["safe_name_match_for_auto_approval"]
+    )
+    strong_exact_identity_match = bool(
+        exact_web_name_match
+        or exact_full_name_match
+        or exact_initial_surname_match
+    )
+
+    raw_name_length = len(compact_name(hrow.get("raw_player_name")))
+    historical_raw_name_count = nullable_int(
+        hrow.get("historical_raw_name_count")
+    )
+    target_web_name_count = nullable_int(
+        trow.get("target_web_name_count")
+    )
+    historical_raw_name_unique = historical_raw_name_count == 1
+    target_web_name_unique = target_web_name_count == 1
+    unique_exact_web_identity = bool(
+        exact_web_name_match
+        and raw_name_length >= 4
+        and historical_raw_name_unique
+        and target_web_name_unique
+    )
+
+    # Conservative identity-continuity policy:
+    # - unchanged team and position: existing safe identity evidence is enough;
+    # - exactly one changed/unknown context: require strong exact identity;
+    # - both contexts changed or unavailable: require full/initial identity, or
+    #   an exact web name that is unique in both historical and target pools.
+    # This preserves real cases such as Gakpo/Bowen/Eze/Cunha/Son while
+    # blocking surname-only collisions such as Young, Dennis, Palmer and Wood.
+    identity_auto_approval_safe = False
+    if safe_name_match and strong_exact_identity_match:
+        if team_match and position_match:
+            identity_auto_approval_safe = True
+        elif team_match or position_match:
+            identity_auto_approval_safe = True
+        elif exact_full_name_match or exact_initial_surname_match:
+            identity_auto_approval_safe = True
+        elif unique_exact_web_identity:
+            identity_auto_approval_safe = True
+
+    if identity_auto_approval_safe:
+        if team_match and position_match:
+            score = max(score, 0.99)
+        elif team_match or position_match:
+            score = max(score, 0.97)
+        else:
+            score = max(score, 0.95)
 
     score = max(0.0, min(1.0, score))
 
-    reasons = ["name_match_type=%s" % name_match_type, "name_score=%.4f" % name_score]
-    if name_safety["safe_name_match_for_auto_approval"]:
+    reasons = [
+        "name_match_type=%s" % name_match_type,
+        "name_score=%.4f" % name_score,
+    ]
+    if safe_name_match:
         reasons.append("safe_auto_name_match")
     else:
         reasons.append("not_safe_auto_name_match")
+
+    if identity_auto_approval_safe:
+        reasons.append("identity_continuity_auto_approval_safe")
+    elif strong_exact_identity_match:
+        reasons.append("exact_identity_requires_manual_review")
+
+    if unique_exact_web_identity:
+        reasons.append("unique_exact_web_identity")
+    elif exact_web_name_match and not (
+        historical_raw_name_unique and target_web_name_unique
+    ):
+        reasons.append("non_unique_exact_web_name")
+
     if position_match:
         reasons.append("position_match")
-    elif hist_position is not None and target_position is not None:
+    elif position_known:
         reasons.append("position_mismatch")
     else:
         reasons.append("position_unknown")
 
     if team_match:
         reasons.append("team_short_name_match")
-    elif mapped_team_id is not None and target_team_id is not None:
+    elif team_known:
         reasons.append("mapped_team_mismatch_or_transfer")
     else:
         reasons.append("team_mapping_unknown")
 
+    if identity_auto_approval_safe and position_known and not position_match:
+        reasons.append("accepted_fpl_position_change")
+    if identity_auto_approval_safe and team_known and not team_match:
+        reasons.append("accepted_team_transfer")
+
     return {
+        "identity_policy_version": IDENTITY_POLICY_VERSION,
         "candidate_score": round(float(score), 4),
         "name_score": round(float(name_score), 4),
         "best_historical_name_variant": best_hist_name,
@@ -553,12 +645,18 @@ def score_candidate(hrow: pd.Series, trow: pd.Series, raw_to_canonical_team: Dic
         "team_match": bool(team_match),
         "mapped_team_id_from_historical_team": mapped_team_id,
         "match_reason": "; ".join(reasons),
-        "exact_web_name_match": name_safety["exact_web_name_match"],
-        "exact_full_name_match": name_safety["exact_full_name_match"],
-        "exact_initial_surname_match": name_safety["exact_initial_surname_match"],
-        "safe_name_match_for_auto_approval": name_safety["safe_name_match_for_auto_approval"],
+        "exact_web_name_match": exact_web_name_match,
+        "exact_full_name_match": exact_full_name_match,
+        "exact_initial_surname_match": exact_initial_surname_match,
+        "strong_exact_identity_match": strong_exact_identity_match,
+        "safe_name_match_for_auto_approval": safe_name_match,
+        "historical_raw_name_count": historical_raw_name_count,
+        "target_web_name_count": target_web_name_count,
+        "historical_raw_name_unique": historical_raw_name_unique,
+        "target_web_name_unique": target_web_name_unique,
+        "unique_exact_web_identity": unique_exact_web_identity,
+        "identity_auto_approval_safe": identity_auto_approval_safe,
     }
-
 
 def base_candidate_row(hrow: pd.Series, trow: Optional[pd.Series], score: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     row: Dict[str, Any] = {
@@ -614,6 +712,29 @@ def build_candidates(
 ) -> pd.DataFrame:
     rows: List[Dict[str, Any]] = []
 
+    historical_players = historical_players.copy()
+    target_players = target_players.copy()
+
+    historical_players["historical_raw_name_key"] = historical_players[
+        "raw_player_name"
+    ].apply(compact_name)
+    historical_name_counts = historical_players[
+        "historical_raw_name_key"
+    ].value_counts(dropna=False)
+    historical_players["historical_raw_name_count"] = historical_players[
+        "historical_raw_name_key"
+    ].map(historical_name_counts)
+
+    target_players["target_web_name_key"] = target_players[
+        "candidate_web_name"
+    ].apply(compact_name)
+    target_name_counts = target_players[
+        "target_web_name_key"
+    ].value_counts(dropna=False)
+    target_players["target_web_name_count"] = target_players[
+        "target_web_name_key"
+    ].map(target_name_counts)
+
     for _, hrow in historical_players.iterrows():
         candidate_rows: List[Dict[str, Any]] = []
         low_rows: List[Dict[str, Any]] = []
@@ -628,12 +749,24 @@ def build_candidates(
 
         candidate_rows = sorted(
             candidate_rows,
-            key=lambda row: (row["candidate_score"], row["name_score"], bool(row["position_match"]), bool(row["team_match"])),
+            key=lambda row: (
+                row["candidate_score"],
+                bool(row.get("identity_auto_approval_safe")),
+                bool(row.get("unique_exact_web_identity")),
+                bool(row.get("strong_exact_identity_match")),
+                row["name_score"],
+                bool(row["position_match"]),
+                bool(row["team_match"]),
+            ),
             reverse=True,
         )
 
         if not candidate_rows and include_low_confidence:
-            candidate_rows = sorted(low_rows, key=lambda row: row["candidate_score"], reverse=True)[:1]
+            candidate_rows = sorted(
+                low_rows,
+                key=lambda row: row["candidate_score"],
+                reverse=True,
+            )[:1]
 
         if not candidate_rows:
             unmatched = base_candidate_row(hrow, None, None)
@@ -649,11 +782,15 @@ def build_candidates(
                     "name_match_type": "unmatched",
                     "position_match": False,
                     "team_match": False,
-                    "mapped_team_id_from_historical_team": raw_to_canonical_team.get(normalize_raw_id(hrow.get("raw_team_id"))),
+                    "mapped_team_id_from_historical_team": raw_to_canonical_team.get(
+                        normalize_raw_id(hrow.get("raw_team_id"))
+                    ),
                     "match_status": "unmatched",
                     "is_auto_approved": False,
                     "needs_manual_review": True,
                     "is_ambiguous": False,
+                    "raw_score_gap_is_ambiguous": False,
+                    "identity_evidence_overrode_score_ambiguity": False,
                     "match_reason": "no candidate above threshold",
                 }
             )
@@ -663,24 +800,88 @@ def build_candidates(
         candidate_rows = candidate_rows[:max_candidates_per_player]
         candidate_count = len(candidate_rows)
         top_score = float(candidate_rows[0]["candidate_score"])
-        second_score = float(candidate_rows[1]["candidate_score"]) if len(candidate_rows) > 1 else None
-        score_gap = None if second_score is None else round(top_score - second_score, 4)
-        is_ambiguous = second_score is not None and (top_score - second_score) <= ambiguous_gap
+        second_score = (
+            float(candidate_rows[1]["candidate_score"])
+            if len(candidate_rows) > 1
+            else None
+        )
+        score_gap = (
+            None
+            if second_score is None
+            else round(top_score - second_score, 4)
+        )
+        raw_score_gap_is_ambiguous = bool(
+            second_score is not None
+            and (top_score - second_score) <= ambiguous_gap
+        )
+
+        top_identity_safe = bool(
+            candidate_rows[0].get("identity_auto_approval_safe")
+        )
+        top_strong_exact = bool(
+            candidate_rows[0].get("strong_exact_identity_match")
+        )
+        second_identity_safe = bool(
+            candidate_rows[1].get("identity_auto_approval_safe")
+        ) if len(candidate_rows) > 1 else False
+        second_strong_exact = bool(
+            candidate_rows[1].get("strong_exact_identity_match")
+        ) if len(candidate_rows) > 1 else False
+
+        identity_evidence_overrode_score_ambiguity = bool(
+            raw_score_gap_is_ambiguous
+            and top_identity_safe
+            and top_strong_exact
+            and not second_identity_safe
+            and not second_strong_exact
+        )
+        is_ambiguous = bool(
+            raw_score_gap_is_ambiguous
+            and not identity_evidence_overrode_score_ambiguity
+        )
 
         for rank, candidate in enumerate(candidate_rows, start=1):
             candidate["candidate_rank"] = rank
             candidate["candidate_count"] = candidate_count
-            candidate["score_gap_to_next"] = score_gap if rank == 1 else None
+            candidate["score_gap_to_next"] = (
+                score_gap if rank == 1 else None
+            )
+            candidate["raw_score_gap_is_ambiguous"] = (
+                raw_score_gap_is_ambiguous if rank == 1 else False
+            )
+            candidate["identity_evidence_overrode_score_ambiguity"] = (
+                identity_evidence_overrode_score_ambiguity
+                if rank == 1
+                else False
+            )
 
-            safe_name_match = bool(candidate.get("safe_name_match_for_auto_approval"))
+            identity_safe = bool(
+                candidate.get("identity_auto_approval_safe")
+            )
 
-            if rank == 1 and top_score >= auto_approve_threshold and not is_ambiguous and safe_name_match:
+            if (
+                rank == 1
+                and top_score >= auto_approve_threshold
+                and not is_ambiguous
+                and identity_safe
+            ):
                 candidate["match_status"] = "auto_approved_candidate"
                 candidate["is_auto_approved"] = True
                 candidate["needs_manual_review"] = False
                 candidate["is_ambiguous"] = False
-            elif rank == 1 and top_score >= auto_approve_threshold and not is_ambiguous:
-                candidate["match_status"] = "high_score_manual_review_candidate"
+                if identity_evidence_overrode_score_ambiguity:
+                    candidate["match_reason"] = (
+                        str(candidate.get("match_reason") or "")
+                        + "; exact_identity_overrode_numeric_ambiguity"
+                    )
+            elif (
+                rank == 1
+                and top_score >= auto_approve_threshold
+                and not is_ambiguous
+            ):
+                candidate["match_status"] = (
+                    "high_score_manual_review_candidate"
+                )
                 candidate["is_auto_approved"] = False
                 candidate["needs_manual_review"] = True
                 candidate["is_ambiguous"] = False
@@ -690,7 +891,9 @@ def build_candidates(
                 candidate["needs_manual_review"] = True
                 candidate["is_ambiguous"] = True
             elif rank == 1:
-                candidate["match_status"] = "low_confidence_top_candidate"
+                candidate["match_status"] = (
+                    "low_confidence_top_candidate"
+                )
                 candidate["is_auto_approved"] = False
                 candidate["needs_manual_review"] = True
                 candidate["is_ambiguous"] = False
@@ -704,7 +907,6 @@ def build_candidates(
 
     return pd.DataFrame(rows)
 
-
 def attach_prior_context(candidates: pd.DataFrame, prior_context: pd.DataFrame) -> pd.DataFrame:
     if prior_context.empty:
         return candidates
@@ -716,44 +918,101 @@ def demote_duplicate_auto_approved_candidates(candidates: pd.DataFrame) -> pd.Da
     if candidates.empty:
         return candidates
 
-    required_columns = {"candidate_rank", "match_status", "candidate_player_id"}
+    required_columns = {
+        "candidate_rank",
+        "match_status",
+        "candidate_player_id",
+    }
     if not required_columns.issubset(set(candidates.columns)):
         return candidates
 
     result = candidates.copy()
+    result["duplicate_auto_approved_candidate_id"] = False
+    result["duplicate_auto_approval_resolved_winner"] = False
 
     top_auto_mask = (
         (result["candidate_rank"] == 1)
         & (result["match_status"] == "auto_approved_candidate")
         & result["candidate_player_id"].notna()
     )
-
     auto_top = result[top_auto_mask].copy()
-    duplicate_candidate_ids = auto_top.loc[
+    duplicate_ids = auto_top.loc[
         auto_top["candidate_player_id"].duplicated(keep=False),
         "candidate_player_id",
     ].dropna().unique()
 
-    if len(duplicate_candidate_ids) == 0:
-        result["duplicate_auto_approved_candidate_id"] = False
-        return result
+    for candidate_player_id in duplicate_ids:
+        group = auto_top[
+            auto_top["candidate_player_id"] == candidate_player_id
+        ].copy()
+        if len(group) < 2:
+            continue
 
-    duplicate_mask = top_auto_mask & result["candidate_player_id"].isin(duplicate_candidate_ids)
+        def priority(row: pd.Series) -> Tuple[int, int, int, float, float]:
+            team_match = bool(row.get("team_match"))
+            position_match = bool(row.get("position_match"))
+            if team_match and position_match:
+                context_rank = 4
+            elif team_match:
+                context_rank = 3
+            elif position_match:
+                context_rank = 2
+            else:
+                context_rank = 1
 
-    result["duplicate_auto_approved_candidate_id"] = False
-    result.loc[duplicate_mask, "duplicate_auto_approved_candidate_id"] = True
-    result.loc[duplicate_mask, "match_status"] = "duplicate_auto_approved_manual_review"
-    result.loc[duplicate_mask, "is_auto_approved"] = False
-    result.loc[duplicate_mask, "needs_manual_review"] = True
-    result.loc[duplicate_mask, "is_ambiguous"] = True
+            if bool(row.get("exact_full_name_match")) or bool(
+                row.get("exact_initial_surname_match")
+            ):
+                identity_rank = 3
+            elif bool(row.get("unique_exact_web_identity")):
+                identity_rank = 2
+            elif bool(row.get("exact_web_name_match")):
+                identity_rank = 1
+            else:
+                identity_rank = 0
 
-    result.loc[duplicate_mask, "match_reason"] = (
-        result.loc[duplicate_mask, "match_reason"].astype(str)
-        + "; duplicate_auto_approved_candidate_id"
-    )
+            return (
+                context_rank,
+                identity_rank,
+                int(bool(row.get("identity_auto_approval_safe"))),
+                float(row.get("candidate_score") or 0.0),
+                float(row.get("name_score") or 0.0),
+            )
+
+        ranked = sorted(
+            [(index, priority(row)) for index, row in group.iterrows()],
+            key=lambda item: item[1],
+            reverse=True,
+        )
+        winner_index, winner_priority = ranked[0]
+        second_priority = ranked[1][1]
+
+        if winner_priority > second_priority:
+            loser_indices = [index for index, _ in ranked[1:]]
+            result.loc[winner_index, "duplicate_auto_approval_resolved_winner"] = True
+            result.loc[winner_index, "match_reason"] = (
+                str(result.loc[winner_index, "match_reason"] or "")
+                + "; duplicate_auto_approval_resolved_by_context_priority"
+            )
+        else:
+            loser_indices = [index for index, _ in ranked]
+
+        if not loser_indices:
+            continue
+
+        result.loc[loser_indices, "duplicate_auto_approved_candidate_id"] = True
+        result.loc[loser_indices, "match_status"] = (
+            "duplicate_auto_approved_manual_review"
+        )
+        result.loc[loser_indices, "is_auto_approved"] = False
+        result.loc[loser_indices, "needs_manual_review"] = True
+        result.loc[loser_indices, "is_ambiguous"] = True
+        result.loc[loser_indices, "match_reason"] = (
+            result.loc[loser_indices, "match_reason"].astype(str)
+            + "; duplicate_auto_approved_candidate_id"
+        )
 
     return result
-
 
 def build_report(
     candidates: pd.DataFrame,
