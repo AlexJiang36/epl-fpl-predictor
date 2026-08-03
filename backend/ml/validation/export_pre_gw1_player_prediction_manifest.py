@@ -9,6 +9,10 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import pandas as pd
 
+from ml.contracts.run_metadata import (
+    build_run_metadata,
+    provenance_inputs_from_file_metadata,
+)
 from ml.validation.resolve_prediction_mode import resolve_prediction_mode
 
 
@@ -1305,6 +1309,56 @@ def build_safety_contract(
     }
 
 
+def build_standard_run_metadata(
+    args: argparse.Namespace,
+    mode_result: Dict[str, Any],
+    created_at: str,
+    manifest_run_id: str,
+    artifact_fingerprints: Dict[str, Dict[str, Any]],
+) -> Dict[str, Any]:
+    # Build the Day75B block without changing Day72B identity fields.
+    return build_run_metadata(
+        run_id=manifest_run_id,
+        run_type="prediction",
+        artifact_type=ARTIFACT_TYPE,
+        source_seasons=list(args.source_seasons),
+        target_season=args.target_season,
+        target_gw=args.target_gw,
+        horizon=1,
+        as_of_time=args.as_of_time,
+        prediction_mode=str(mode_result.get("resolved_prediction_mode")),
+        created_at=created_at,
+        feature_version=args.player_feature_version,
+        model_version=args.expected_model_version,
+        rules_versions={
+            "scoring": args.scoring_rules_version,
+            "role_contract": args.role_contract_version,
+            "threshold_policy": args.threshold_policy_version,
+        },
+        manifest_version=MANIFEST_VERSION,
+        artifact_version=MANIFEST_VERSION,
+        additional_versions={
+            "scoreline_model": args.scoreline_model_version,
+        },
+        provenance={
+            "producer": (
+                "ml.validation."
+                "export_pre_gw1_player_prediction_manifest"
+            ),
+            "inputs": provenance_inputs_from_file_metadata(
+                artifact_fingerprints
+            ),
+            "parent_run_ids": [],
+            "notes": [
+                (
+                    "Day75B compatibility proof: the existing Day72B "
+                    "top-level metadata and run_id remain unchanged."
+                )
+            ],
+        },
+    ).to_dict()
+
+
 def build_manifest(
     args: argparse.Namespace,
     preview: pd.DataFrame,
@@ -1326,11 +1380,28 @@ def build_manifest(
         args.target_gw,
         created_at.replace(":", "").replace("+", "_").replace(".", ""),
     )
+    artifact_fingerprints = {
+        "prediction_preview_csv": file_metadata(
+            args.prediction_preview_csv
+        ),
+        "day72a_json": file_metadata(args.day72a_json),
+        "day71a_json": file_metadata(args.day71a_json),
+        "day71b_json": file_metadata(args.day71b_json),
+        "day70c_json": file_metadata(args.day70c_json),
+    }
+    standard_run_metadata = build_standard_run_metadata(
+        args=args,
+        mode_result=mode_result,
+        created_at=created_at,
+        manifest_run_id=manifest_run_id,
+        artifact_fingerprints=artifact_fingerprints,
+    )
     return {
         "created_at": created_at,
         "run_id": manifest_run_id,
         "artifact_type": ARTIFACT_TYPE,
         "manifest_version": MANIFEST_VERSION,
+        "run_metadata": standard_run_metadata,
         "source_seasons": list(args.source_seasons),
         "target_season": args.target_season,
         "target_gw": args.target_gw,
@@ -1368,15 +1439,7 @@ def build_manifest(
             "It does not approve trained-model claims, public predictions, optimizer "
             "inputs, registry activation, or database writes."
         ),
-        "artifact_fingerprints": {
-            "prediction_preview_csv": file_metadata(
-                args.prediction_preview_csv
-            ),
-            "day72a_json": file_metadata(args.day72a_json),
-            "day71a_json": file_metadata(args.day71a_json),
-            "day71b_json": file_metadata(args.day71b_json),
-            "day70c_json": file_metadata(args.day70c_json),
-        },
+        "artifact_fingerprints": artifact_fingerprints,
         "source_reports": {
             "day72a": source_report_summary(day72a_result),
             "day71a": source_report_summary(day71a_result),
