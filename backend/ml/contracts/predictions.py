@@ -412,6 +412,104 @@ class SafetyMetadata:
 
 
 @dataclass(frozen=True)
+class PlayerPredictionManifestContract:
+    """Stable preview-only view of the Day72B player manifest.
+
+    ``preview_schema_consumption_allowed`` authorizes only explicit adaptation
+    of the validated preview rows into the Day76B schema.  It does not turn the
+    preview into an approved recommendation, public prediction, or writable
+    production artifact.
+    """
+
+    context: PredictionContext
+    manifest_version: str
+    artifact_type: str
+    passed: bool
+    preview_schema_consumption_allowed: bool
+    original_optimizer_input_ready: bool
+    ops_preview_ready: bool
+    blockers: Tuple[str, ...] = field(default_factory=tuple)
+    warnings: Tuple[str, ...] = field(default_factory=tuple)
+    artifact_fingerprints: Mapping[str, Any] = field(default_factory=dict)
+    readiness_status: str = READINESS_PREVIEW_ONLY
+    production_ready: bool = False
+    prediction_write_allowed: bool = False
+
+    def __post_init__(self) -> None:
+        if self.context.output_type != OUTPUT_PLAYER_POINTS:
+            raise PredictionContractError(
+                "Player manifest requires output_type=%s." % OUTPUT_PLAYER_POINTS
+            )
+        object.__setattr__(
+            self,
+            "manifest_version",
+            _identifier(self.manifest_version, "manifest_version"),
+        )
+        artifact_type = _identifier(self.artifact_type, "artifact_type")
+        if artifact_type != "pre_gw1_player_prediction_manifest":
+            raise PredictionContractError(
+                "Unsupported Day72B artifact_type=%s." % artifact_type
+            )
+        object.__setattr__(self, "artifact_type", artifact_type)
+        object.__setattr__(self, "passed", _strict_bool(self.passed, "passed"))
+        object.__setattr__(
+            self,
+            "preview_schema_consumption_allowed",
+            _strict_bool(
+                self.preview_schema_consumption_allowed,
+                "preview_schema_consumption_allowed",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "original_optimizer_input_ready",
+            _strict_bool(
+                self.original_optimizer_input_ready,
+                "original_optimizer_input_ready",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "ops_preview_ready",
+            _strict_bool(self.ops_preview_ready, "ops_preview_ready"),
+        )
+        object.__setattr__(self, "blockers", _string_tuple(self.blockers, "blockers"))
+        object.__setattr__(self, "warnings", _string_tuple(self.warnings, "warnings"))
+        object.__setattr__(
+            self,
+            "artifact_fingerprints",
+            _json_safe_mapping(self.artifact_fingerprints, "artifact_fingerprints"),
+        )
+        if self.readiness_status != READINESS_PREVIEW_ONLY:
+            raise PredictionContractError(
+                "Day72B manifest adapter must remain preview_only."
+            )
+        object.__setattr__(
+            self,
+            "production_ready",
+            _strict_bool(self.production_ready, "production_ready"),
+        )
+        object.__setattr__(
+            self,
+            "prediction_write_allowed",
+            _strict_bool(
+                self.prediction_write_allowed, "prediction_write_allowed"
+            ),
+        )
+        if self.production_ready or self.prediction_write_allowed:
+            raise PredictionContractError(
+                "Day72B preview manifest cannot be promoted to production or writes."
+            )
+        if self.preview_schema_consumption_allowed and (not self.passed or self.blockers):
+            raise PredictionContractError(
+                "Preview schema consumption requires a passing manifest with no blockers."
+            )
+
+    def to_dict(self) -> Dict[str, Any]:
+        return _dataclass_to_dict(self)
+
+
+@dataclass(frozen=True)
 class MatchPredictionOutput:
     context: PredictionContext
     safety: SafetyMetadata
@@ -581,6 +679,11 @@ class PlayerPointsPredictionOutput:
     start_probability: float
     appearance_probability: float
     has_fixture: bool
+    player_status: str
+    status_cutoff_valid: bool
+    status_hard_guardrail_applied: bool
+    selection_eligible: bool
+    eligibility_reason: str
     fixture_id: Optional[int] = None
     fpl_fixture_id: Optional[int] = None
     fpl_player_id: Optional[int] = None
@@ -626,6 +729,40 @@ class PlayerPointsPredictionOutput:
         if self.start_probability > self.appearance_probability + 1e-8:
             raise PredictionContractError("start_probability cannot exceed appearance_probability.")
         object.__setattr__(self, "has_fixture", _strict_bool(self.has_fixture, "has_fixture"))
+        object.__setattr__(
+            self, "player_status", _required_text(self.player_status, "player_status").lower()
+        )
+        object.__setattr__(
+            self,
+            "status_cutoff_valid",
+            _strict_bool(self.status_cutoff_valid, "status_cutoff_valid"),
+        )
+        object.__setattr__(
+            self,
+            "status_hard_guardrail_applied",
+            _strict_bool(
+                self.status_hard_guardrail_applied,
+                "status_hard_guardrail_applied",
+            ),
+        )
+        object.__setattr__(
+            self,
+            "selection_eligible",
+            _strict_bool(self.selection_eligible, "selection_eligible"),
+        )
+        object.__setattr__(
+            self,
+            "eligibility_reason",
+            _identifier(self.eligibility_reason, "eligibility_reason"),
+        )
+        if self.selection_eligible and not self.status_cutoff_valid:
+            raise PredictionContractError(
+                "selection_eligible=True requires status_cutoff_valid=True."
+            )
+        if self.selection_eligible and self.status_hard_guardrail_applied:
+            raise PredictionContractError(
+                "selection_eligible=True is incompatible with a hard status guardrail."
+            )
         object.__setattr__(self, "fixture_id", _int_value(self.fixture_id, "fixture_id", 1, optional=True))
         object.__setattr__(self, "fpl_fixture_id", _int_value(self.fpl_fixture_id, "fpl_fixture_id", 1, optional=True))
         object.__setattr__(self, "fpl_player_id", _int_value(self.fpl_player_id, "fpl_player_id", 1, optional=True))
@@ -702,6 +839,11 @@ class PlayerPointsPredictionOutput:
             "opponent_name": self.opponent_name,
             "is_home": self.is_home,
             "has_fixture": self.has_fixture,
+            "player_status": self.player_status,
+            "status_cutoff_valid": self.status_cutoff_valid,
+            "status_hard_guardrail_applied": self.status_hard_guardrail_applied,
+            "selection_eligible": self.selection_eligible,
+            "eligibility_reason": self.eligibility_reason,
             "appearance_probability": self.appearance_probability,
             "start_probability": self.start_probability,
             "expected_minutes": self.expected_minutes,
@@ -860,6 +1002,11 @@ CONTRACT_FIELD_REQUIREMENTS: Mapping[str, Mapping[str, Tuple[str, ...]]] = {
             "start_probability",
             "appearance_probability",
             "has_fixture",
+            "player_status",
+            "status_cutoff_valid",
+            "status_hard_guardrail_applied",
+            "selection_eligible",
+            "eligibility_reason",
         ),
         "optional": (
             "fixture_id",
@@ -1045,6 +1192,157 @@ def adapt_day70c_scoreline_preview(
     )
 
 
+def adapt_day72b_player_prediction_manifest(
+    manifest: Mapping[str, Any],
+) -> PlayerPredictionManifestContract:
+    """Adapt the Day72B manifest without granting production approval.
+
+    A passing Day72B manifest may authorize explicit conversion of its Day72A
+    rows into the stable Day76B preview schema.  The adapter preserves the
+    original ``ready_for_opening_squad_optimizer_input`` flag, which remains
+    false for Day72B v1, and never treats schema consumption as recommendation
+    approval.
+    """
+    raw = _mapping_from_object(manifest)
+    artifact_type = _required_text(raw.get("artifact_type"), "artifact_type")
+    manifest_version = _required_text(
+        raw.get("manifest_version"), "manifest_version"
+    )
+    model_name = _required_text(raw.get("model_name"), "model_name")
+    model_version = _required_text(raw.get("model_version"), "model_version")
+    prediction_scope = _required_text(
+        raw.get("prediction_scope"), "prediction_scope"
+    )
+
+    nested_metadata = raw.get("run_metadata")
+    if nested_metadata is not None:
+        if not isinstance(nested_metadata, Mapping):
+            raise PredictionContractError("run_metadata must be a mapping.")
+        nested_raw = _mapping_from_object(nested_metadata)
+        nested_versions = nested_raw.get("versions") or {}
+        if not isinstance(nested_versions, Mapping):
+            raise PredictionContractError(
+                "run_metadata.versions must be a mapping."
+            )
+        context = PredictionContext.from_run_metadata(
+            nested_metadata,
+            output_type=OUTPUT_PLAYER_POINTS,
+            model_name=model_name,
+            model_version=model_version,
+            prediction_scope=prediction_scope,
+        )
+        identity_pairs = (
+            ("run_id", raw.get("run_id"), context.run_id),
+            ("target_season", raw.get("target_season"), context.target_season),
+            ("target_gw", raw.get("target_gw"), context.target_gw),
+            ("prediction_mode", raw.get("resolved_prediction_mode"), context.prediction_mode),
+            ("model_version", nested_versions.get("model_version"), model_version),
+            ("feature_version", raw.get("player_feature_version"), context.feature_version),
+            ("artifact_version", nested_versions.get("artifact_version"), manifest_version),
+            ("manifest_version", nested_versions.get("manifest_version"), manifest_version),
+        )
+        for field_name, top_value, nested_value in identity_pairs:
+            if top_value is not None and str(top_value) != str(nested_value):
+                raise PredictionContractError(
+                    "Day72B top-level %s does not match run_metadata."
+                    % field_name
+                )
+        top_sources = _source_seasons(raw.get("source_seasons"))
+        if top_sources != context.source_seasons:
+            raise PredictionContractError(
+                "Day72B top-level source_seasons do not match run_metadata."
+            )
+        top_scoring_version = raw.get("scoring_rules_version")
+        nested_scoring_version = context.rules_versions.get("scoring")
+        if (
+            top_scoring_version is not None
+            and str(top_scoring_version) != str(nested_scoring_version)
+        ):
+            raise PredictionContractError(
+                "Day72B top-level scoring_rules_version does not match run_metadata."
+            )
+        top_as_of = raw.get("as_of_time")
+        if top_as_of is not None and _utc_iso(top_as_of, "as_of_time") != context.as_of_time:
+            raise PredictionContractError(
+                "Day72B top-level as_of_time does not match run_metadata."
+            )
+    else:
+        context = PredictionContext(
+            output_type=OUTPUT_PLAYER_POINTS,
+            source_seasons=_source_seasons(raw.get("source_seasons")),
+            target_season=raw.get("target_season"),
+            target_gw=raw.get("target_gw"),
+            as_of_time=raw.get("as_of_time"),
+            prediction_mode=raw.get("resolved_prediction_mode"),
+            prediction_scope=prediction_scope,
+            run_id=raw.get("run_id"),
+            model_name=model_name,
+            model_version=model_version,
+            feature_version=raw.get("player_feature_version"),
+            rules_versions={"scoring": raw.get("scoring_rules_version")},
+            source_artifact_version=manifest_version,
+        )
+
+    unsafe_flags = (
+        "writes_database",
+        "ready_for_public_prediction",
+        "ready_for_prediction_write",
+        "ready_for_production_write",
+    )
+    enabled_unsafe = [
+        name for name in unsafe_flags if _legacy_bool(raw.get(name), False)
+    ]
+    if enabled_unsafe:
+        raise PredictionContractError(
+            "Day72B preview manifest contains unsafe enabled flags: %s."
+            % ", ".join(enabled_unsafe)
+        )
+
+    blockers = _string_tuple(raw.get("blockers") or (), "blockers")
+    warnings = _string_tuple(raw.get("warnings") or (), "warnings")
+    passed = _legacy_bool(raw.get("passed"), False)
+    manifest_ready = _legacy_bool(
+        raw.get("ready_for_pre_gw1_player_prediction_manifest"), False
+    )
+    ops_preview_ready = _legacy_bool(raw.get("ready_for_ops_preview"), False)
+    original_optimizer_ready = _legacy_bool(
+        raw.get("ready_for_opening_squad_optimizer_input"), False
+    )
+
+    safety_contract = raw.get("safety_contract") or {}
+    if not isinstance(safety_contract, Mapping):
+        raise PredictionContractError("safety_contract must be a mapping.")
+    row_gate = safety_contract.get("row_level_write_gate") or {}
+    if not isinstance(row_gate, Mapping):
+        raise PredictionContractError(
+            "safety_contract.row_level_write_gate must be a mapping."
+        )
+    write_gate_passed = _legacy_bool(row_gate.get("write_gate_passed"), False)
+    preview_schema_consumption_allowed = bool(
+        passed
+        and manifest_ready
+        and ops_preview_ready
+        and not blockers
+        and write_gate_passed
+    )
+
+    return PlayerPredictionManifestContract(
+        context=context,
+        manifest_version=manifest_version,
+        artifact_type=artifact_type,
+        passed=passed,
+        preview_schema_consumption_allowed=preview_schema_consumption_allowed,
+        original_optimizer_input_ready=original_optimizer_ready,
+        ops_preview_ready=ops_preview_ready,
+        blockers=blockers,
+        warnings=warnings,
+        artifact_fingerprints=raw.get("artifact_fingerprints") or {},
+        readiness_status=READINESS_PREVIEW_ONLY,
+        production_ready=False,
+        prediction_write_allowed=False,
+    )
+
+
 def adapt_day72a_player_points_preview(row: Mapping[str, Any]) -> PlayerPointsPredictionOutput:
     """Adapt Day72A to the stable player-points contract used by Fast Lane."""
     fallback_level = _int_value(row.get("fallback_level"), "fallback_level", 0, optional=True)
@@ -1104,6 +1402,11 @@ def adapt_day72a_player_points_preview(row: Mapping[str, Any]) -> PlayerPointsPr
         "opponent_short_name",
         "is_home",
         "has_fixture",
+        "status",
+        "status_cutoff_valid",
+        "status_hard_guardrail_applied",
+        "selection_eligible",
+        "eligibility_reason",
         "appearance_probability",
         "start_probability",
         "expected_minutes",
@@ -1133,6 +1436,31 @@ def adapt_day72a_player_points_preview(row: Mapping[str, Any]) -> PlayerPointsPr
         "calibration_status",
         "guardrail_status",
     }
+    status_cutoff_valid = _strict_bool(
+        row.get("status_cutoff_valid"), "status_cutoff_valid"
+    )
+    status_hard_guardrail_applied = _strict_bool(
+        row.get("status_hard_guardrail_applied"),
+        "status_hard_guardrail_applied",
+    )
+    derived_eligible = bool(
+        status_cutoff_valid and not status_hard_guardrail_applied
+    )
+    if row.get("selection_eligible") is None:
+        selection_eligible = derived_eligible
+    else:
+        selection_eligible = _strict_bool(
+            row.get("selection_eligible"), "selection_eligible"
+        )
+    eligibility_reason = row.get("eligibility_reason")
+    if eligibility_reason is None:
+        if selection_eligible:
+            eligibility_reason = "eligible_preview_status"
+        elif status_hard_guardrail_applied:
+            eligibility_reason = "status_hard_guardrail_applied"
+        else:
+            eligibility_reason = "status_cutoff_invalid"
+
     extensions = {key: value for key, value in row.items() if key not in known_fields}
     return PlayerPointsPredictionOutput(
         context=context,
@@ -1153,6 +1481,11 @@ def adapt_day72a_player_points_preview(row: Mapping[str, Any]) -> PlayerPointsPr
         opponent_name=row.get("opponent_team_name") or row.get("opponent_short_name"),
         is_home=row.get("is_home"),
         has_fixture=row.get("has_fixture"),
+        player_status=row.get("status") or "unknown",
+        status_cutoff_valid=status_cutoff_valid,
+        status_hard_guardrail_applied=status_hard_guardrail_applied,
+        selection_eligible=selection_eligible,
+        eligibility_reason=eligibility_reason,
         appearance_probability=row.get("appearance_probability"),
         start_probability=row.get("start_probability"),
         expected_minutes=row.get("expected_minutes"),
@@ -1216,5 +1549,10 @@ def adapt_legacy_db_player_prediction(
         start_probability=0.0,
         appearance_probability=0.0,
         has_fixture=False,
+        player_status="unknown",
+        status_cutoff_valid=False,
+        status_hard_guardrail_applied=False,
+        selection_eligible=False,
+        eligibility_reason="legacy_status_unknown",
         extensions={"legacy_created_at": row.get("created_at")},
     )

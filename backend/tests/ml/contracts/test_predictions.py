@@ -205,6 +205,11 @@ class PredictionContractTests(unittest.TestCase):
             start_probability=0.8,
             appearance_probability=0.9,
             has_fixture=True,
+            player_status="a",
+            status_cutoff_valid=True,
+            status_hard_guardrail_applied=False,
+            selection_eligible=True,
+            eligibility_reason="eligible_preview_status",
             fixture_id=1,
             opponent_team_id=2,
             is_home=True,
@@ -229,6 +234,34 @@ class PredictionContractTests(unittest.TestCase):
                 start_probability=0.8,
                 appearance_probability=0.9,
                 has_fixture=False,
+                player_status="a",
+                status_cutoff_valid=True,
+                status_hard_guardrail_applied=False,
+                selection_eligible=True,
+                eligibility_reason="eligible_preview_status",
+            )
+
+    def test_player_points_rejects_eligible_with_invalid_status_cutoff(self) -> None:
+        with self.assertRaises(PredictionContractError):
+            PlayerPointsPredictionOutput(
+                context=self.context(OUTPUT_PLAYER_POINTS),
+                safety=self.safety(),
+                player_id=10,
+                team_id=1,
+                position="MID",
+                price=7.5,
+                now_cost=75,
+                predicted_points=5.2,
+                expected_minutes=82.0,
+                start_probability=0.8,
+                appearance_probability=0.9,
+                has_fixture=True,
+                player_status="i",
+                status_cutoff_valid=False,
+                status_hard_guardrail_applied=True,
+                selection_eligible=True,
+                eligibility_reason="eligible_preview_status",
+                fixture_id=1,
             )
 
     def test_ranking_contract(self) -> None:
@@ -259,6 +292,8 @@ class PredictionContractTests(unittest.TestCase):
     def test_field_requirement_documentation(self) -> None:
         requirements = contract_field_requirements(OUTPUT_PLAYER_POINTS)
         self.assertIn("predicted_points", requirements["mandatory"])
+        self.assertIn("selection_eligible", requirements["mandatory"])
+        self.assertIn("eligibility_reason", requirements["mandatory"])
         self.assertIn("extensions", requirements["optional"])
 
 
