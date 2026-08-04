@@ -818,6 +818,24 @@ def evaluate_opening_squad_objective(
             weighted_discount = role_weight * discount
 
             gross = row["predicted_points"] * weighted_discount
+
+            if not row["has_fixture"]:
+                review_reasons.append(
+                    {
+                        "code": "player_fixture_missing_or_unconfirmed",
+                        "message": (
+                            "The projection row has has_fixture=False; "
+                            "the supplied predicted points remain visible "
+                            "for reconciliation, but the recommendation "
+                            "requires explicit fixture review."
+                        ),
+                        "player_id": player_id,
+                        "target_gw": gw,
+                        "role": assignment["role"],
+                        "predicted_points": _round(row["predicted_points"]),
+                    }
+                )
+
             minute_shortfall = max(
                 0.0,
                 policy.risk_penalties.expected_minutes_target
@@ -907,6 +925,7 @@ def evaluate_opening_squad_objective(
                 "predicted_points": _round(row["predicted_points"]),
                 "expected_minutes": _round(row["expected_minutes"]),
                 "start_probability": _round(row["start_probability"]),
+                "has_fixture": row["has_fixture"],
                 "fallback_used": row["fallback_used"],
                 "fallback_level": row["fallback_level"],
                 "uncertainty_width": (
@@ -1012,6 +1031,11 @@ def evaluate_opening_squad_objective(
             "risk_treatment": (
                 "minutes, start probability, fallback, and uncertainty "
                 "penalties are subtracted after role and GW weighting"
+            ),
+            "fixture_treatment": (
+                "has_fixture=False is never silent: supplied prediction "
+                "values remain in the decomposition, while the result is "
+                "marked for explicit fixture/manual review"
             ),
             "budget_treatment": (
                 "value and bank utility are optional; Fast Lane defaults "

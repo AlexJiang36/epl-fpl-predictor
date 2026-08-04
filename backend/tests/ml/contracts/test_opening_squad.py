@@ -239,6 +239,36 @@ class OpeningSquadObjectiveContractTests(unittest.TestCase):
             {reason["code"] for reason in result["manual_review_reasons"]},
         )
 
+    def test_missing_fixture_is_disclosed_for_manual_review(self):
+        rows = self.rows(gameweeks=(1,))
+        target = self.row(rows, "D1", 1)
+        target["has_fixture"] = False
+
+        result = self.evaluate(
+            policy=self.policy(HORIZON_GW1_ONLY),
+            rows=rows,
+        )
+        contribution = self.contribution(result, "D1", 1)
+        reasons = [
+            reason
+            for reason in result["manual_review_reasons"]
+            if reason["code"]
+            == "player_fixture_missing_or_unconfirmed"
+        ]
+
+        self.assertFalse(contribution["has_fixture"])
+        self.assertTrue(result["manual_review_required"])
+        self.assertEqual(len(reasons), 1)
+        self.assertEqual(reasons[0]["player_id"], "D1")
+        self.assertEqual(reasons[0]["target_gw"], 1)
+        self.assertEqual(result["recommendation_status"], "preview_only")
+        self.assertFalse(result["writes_enabled"])
+        self.assertTrue(result["reconciliation"]["passed"])
+        self.assertIn(
+            "has_fixture=False",
+            result["explanation"]["fixture_treatment"],
+        )
+
     def test_incomplete_primary_horizon_falls_back_to_gw1(self):
         result = self.evaluate(rows=self.rows(gameweeks=(1, 2, 3, 4)))
         self.assertEqual(result["requested_gameweeks"], [1, 2, 3, 4, 5])
