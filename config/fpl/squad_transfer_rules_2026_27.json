@@ -1,0 +1,603 @@
+{
+  "schema_version": "fpl_squad_transfer_rules_v1",
+  "competition": "FPL",
+  "effective_season": "2026_27",
+  "rules_version": "fpl_2026_27_squad_transfer_v1",
+  "status": "verified_target_season_registry",
+  "source_notes": [
+    "Official FPL squad-selection guidance: £100.0m budget, 15 players, position quotas 2/5/5/3, and maximum three players per club.",
+    "Official 2026/27 guidance: one free transfer per Gameweek, up to five may be stored, and additional transfers cost four points.",
+    "Official 2026/27 guidance explicitly states that the 2025/26 AFCON free-transfer top-up does not recur because AFCON is not taking place during the 2026/27 campaign.",
+    "Official FPL chip guidance: Wildcard and Free Hit provide unlimited transfers for the active Gameweek while preserving previously banked free transfers; no normal weekly accrual is added through that chip transition.",
+    "Live selling-price and bank calculations remain external inputs; this registry validates integer price units and caller-supplied affordability limits."
+  ],
+  "positions": [
+    "GKP",
+    "DEF",
+    "MID",
+    "FWD"
+  ],
+  "units": {
+    "price_unit": "tenths_of_million_gbp",
+    "one_price_unit_gbp_millions": 0.1,
+    "initial_budget_units": 1000
+  },
+  "squad": {
+    "size": 15,
+    "position_quotas": {
+      "GKP": 2,
+      "DEF": 5,
+      "MID": 5,
+      "FWD": 3
+    },
+    "max_players_per_club": 3,
+    "duplicate_players_allowed": false
+  },
+  "lineup": {
+    "starting_size": 11,
+    "bench_size": 4,
+    "position_bounds": {
+      "GKP": {
+        "min": 1,
+        "max": 1
+      },
+      "DEF": {
+        "min": 3,
+        "max": 5
+      },
+      "MID": {
+        "min": 2,
+        "max": 5
+      },
+      "FWD": {
+        "min": 1,
+        "max": 3
+      }
+    },
+    "bench": {
+      "goalkeepers": 1,
+      "outfield_players": 3
+    },
+    "captain_required": true,
+    "vice_captain_required": true,
+    "captain_and_vice_must_differ": true
+  },
+  "transfers": {
+    "pre_season": {
+      "unlimited_free_transfers": true,
+      "hit_cost_points": 0
+    },
+    "weekly": {
+      "free_transfers_accrued_per_gameweek": 1,
+      "maximum_stored_free_transfers": 5,
+      "hit_cost_points_per_additional_transfer": 4,
+      "incoming_count_must_equal_outgoing_count": true
+    },
+    "chip_behavior": {
+      "wildcard": {
+        "unlimited_free_transfers": true,
+        "preserve_saved_free_transfers": true,
+        "weekly_accrual_after_chip": 0,
+        "remove_transfer_hits": true,
+        "temporary_squad": false
+      },
+      "free_hit": {
+        "unlimited_free_transfers": true,
+        "preserve_saved_free_transfers": true,
+        "weekly_accrual_after_chip": 0,
+        "remove_transfer_hits": true,
+        "temporary_squad": true
+      }
+    },
+    "special_events": []
+  },
+  "deterministic_examples": {
+    "base_squad": [
+      {
+        "player_id": "G1",
+        "position": "GKP",
+        "club_id": "AAA",
+        "price_units": 50
+      },
+      {
+        "player_id": "G2",
+        "position": "GKP",
+        "club_id": "BBB",
+        "price_units": 45
+      },
+      {
+        "player_id": "D1",
+        "position": "DEF",
+        "club_id": "AAA",
+        "price_units": 55
+      },
+      {
+        "player_id": "D2",
+        "position": "DEF",
+        "club_id": "BBB",
+        "price_units": 50
+      },
+      {
+        "player_id": "D3",
+        "position": "DEF",
+        "club_id": "CCC",
+        "price_units": 50
+      },
+      {
+        "player_id": "D4",
+        "position": "DEF",
+        "club_id": "DDD",
+        "price_units": 45
+      },
+      {
+        "player_id": "D5",
+        "position": "DEF",
+        "club_id": "EEE",
+        "price_units": 45
+      },
+      {
+        "player_id": "M1",
+        "position": "MID",
+        "club_id": "AAA",
+        "price_units": 115
+      },
+      {
+        "player_id": "M2",
+        "position": "MID",
+        "club_id": "BBB",
+        "price_units": 90
+      },
+      {
+        "player_id": "M3",
+        "position": "MID",
+        "club_id": "CCC",
+        "price_units": 75
+      },
+      {
+        "player_id": "M4",
+        "position": "MID",
+        "club_id": "DDD",
+        "price_units": 60
+      },
+      {
+        "player_id": "M5",
+        "position": "MID",
+        "club_id": "EEE",
+        "price_units": 50
+      },
+      {
+        "player_id": "F1",
+        "position": "FWD",
+        "club_id": "CCC",
+        "price_units": 125
+      },
+      {
+        "player_id": "F2",
+        "position": "FWD",
+        "club_id": "DDD",
+        "price_units": 80
+      },
+      {
+        "player_id": "F3",
+        "position": "FWD",
+        "club_id": "EEE",
+        "price_units": 55
+      }
+    ],
+    "squad_cases": [
+      {
+        "name": "legal_15_player_squad",
+        "mutations": [],
+        "expected_valid": true
+      },
+      {
+        "name": "illegal_budget_exceeded",
+        "mutations": [
+          {
+            "operation": "set_price_units",
+            "player_id": "F3",
+            "value": 70
+          }
+        ],
+        "expected_valid": false
+      },
+      {
+        "name": "illegal_four_players_from_one_club",
+        "mutations": [
+          {
+            "operation": "set_club_id",
+            "player_id": "D4",
+            "value": "AAA"
+          }
+        ],
+        "expected_valid": false
+      },
+      {
+        "name": "illegal_position_quota",
+        "mutations": [
+          {
+            "operation": "set_position",
+            "player_id": "F3",
+            "value": "MID"
+          }
+        ],
+        "expected_valid": false
+      },
+      {
+        "name": "illegal_duplicate_player_id",
+        "mutations": [
+          {
+            "operation": "set_player_id",
+            "player_id": "F3",
+            "value": "F2"
+          }
+        ],
+        "expected_valid": false
+      }
+    ],
+    "lineup_cases": [
+      {
+        "name": "legal_1_4_4_2_lineup",
+        "starting_player_ids": [
+          "G1",
+          "D1",
+          "D2",
+          "D3",
+          "D4",
+          "M1",
+          "M2",
+          "M3",
+          "M4",
+          "F1",
+          "F2"
+        ],
+        "bench_order": [
+          "G2",
+          "D5",
+          "M5",
+          "F3"
+        ],
+        "captain_player_id": "M1",
+        "vice_captain_player_id": "F1",
+        "expected_valid": true
+      },
+      {
+        "name": "legal_1_3_5_2_lineup",
+        "starting_player_ids": [
+          "G1",
+          "D1",
+          "D2",
+          "D3",
+          "M1",
+          "M2",
+          "M3",
+          "M4",
+          "M5",
+          "F1",
+          "F2"
+        ],
+        "bench_order": [
+          "G2",
+          "D4",
+          "D5",
+          "F3"
+        ],
+        "captain_player_id": "M2",
+        "vice_captain_player_id": "F2",
+        "expected_valid": true
+      },
+      {
+        "name": "illegal_two_starting_goalkeepers",
+        "starting_player_ids": [
+          "G1",
+          "G2",
+          "D1",
+          "D2",
+          "D3",
+          "M1",
+          "M2",
+          "M3",
+          "M4",
+          "F1",
+          "F2"
+        ],
+        "bench_order": [
+          "D4",
+          "D5",
+          "M5",
+          "F3"
+        ],
+        "captain_player_id": "M1",
+        "vice_captain_player_id": "F1",
+        "expected_valid": false
+      },
+      {
+        "name": "illegal_captain_on_bench",
+        "starting_player_ids": [
+          "G1",
+          "D1",
+          "D2",
+          "D3",
+          "D4",
+          "M1",
+          "M2",
+          "M3",
+          "M4",
+          "F1",
+          "F2"
+        ],
+        "bench_order": [
+          "G2",
+          "D5",
+          "M5",
+          "F3"
+        ],
+        "captain_player_id": "M5",
+        "vice_captain_player_id": "F1",
+        "expected_valid": false
+      }
+    ],
+    "transfer_cases": [
+      {
+        "name": "roll_then_make_three_transfers_with_two_free",
+        "initial_free_transfers": 1,
+        "expected_valid": true,
+        "steps": [
+          {
+            "transfer_count": 0,
+            "completed_gameweek": 1,
+            "phase": "in_season",
+            "chip": null,
+            "expected": {
+              "free_transfers_used": 0,
+              "charged_transfers": 0,
+              "points_cost": 0,
+              "free_transfers_after_transfers": 1,
+              "free_transfers_next_gameweek": 2
+            }
+          },
+          {
+            "transfer_count": 3,
+            "completed_gameweek": 2,
+            "phase": "in_season",
+            "chip": null,
+            "expected": {
+              "free_transfers_used": 2,
+              "charged_transfers": 1,
+              "points_cost": 4,
+              "free_transfers_after_transfers": 0,
+              "free_transfers_next_gameweek": 1
+            }
+          }
+        ]
+      },
+      {
+        "name": "free_transfer_storage_caps_at_five",
+        "initial_free_transfers": 4,
+        "expected_valid": true,
+        "steps": [
+          {
+            "transfer_count": 0,
+            "completed_gameweek": 10,
+            "phase": "in_season",
+            "chip": null,
+            "expected": {
+              "free_transfers_next_gameweek": 5,
+              "points_cost": 0
+            }
+          },
+          {
+            "transfer_count": 0,
+            "completed_gameweek": 11,
+            "phase": "in_season",
+            "chip": null,
+            "expected": {
+              "free_transfers_next_gameweek": 5,
+              "points_cost": 0
+            }
+          }
+        ]
+      },
+      {
+        "name": "wildcard_allows_many_transfers_and_preserves_bank",
+        "initial_free_transfers": 3,
+        "expected_valid": true,
+        "steps": [
+          {
+            "transfer_count": 12,
+            "completed_gameweek": 8,
+            "phase": "in_season",
+            "chip": "wildcard",
+            "expected": {
+              "charged_transfers": 0,
+              "points_cost": 0,
+              "free_transfers_after_transfers": 3,
+              "weekly_accrual_applied": 0,
+              "free_transfers_next_gameweek": 3
+            }
+          }
+        ]
+      },
+      {
+        "name": "free_hit_allows_many_transfers_and_preserves_bank",
+        "initial_free_transfers": 4,
+        "expected_valid": true,
+        "steps": [
+          {
+            "transfer_count": 8,
+            "completed_gameweek": 12,
+            "phase": "in_season",
+            "chip": "free_hit",
+            "expected": {
+              "charged_transfers": 0,
+              "points_cost": 0,
+              "free_transfers_after_transfers": 4,
+              "weekly_accrual_applied": 0,
+              "free_transfers_next_gameweek": 4
+            }
+          }
+        ]
+      },
+      {
+        "name": "no_2026_27_special_top_up_after_gameweek_15",
+        "initial_free_transfers": 2,
+        "expected_valid": true,
+        "steps": [
+          {
+            "transfer_count": 2,
+            "completed_gameweek": 15,
+            "phase": "in_season",
+            "chip": null,
+            "expected": {
+              "free_transfers_used": 2,
+              "charged_transfers": 0,
+              "points_cost": 0,
+              "free_transfers_after_transfers": 0,
+              "weekly_accrual_applied": 1,
+              "special_event_applied": null,
+              "free_transfers_next_gameweek": 1
+            }
+          }
+        ]
+      },
+      {
+        "name": "preseason_supports_more_than_one_transfer",
+        "initial_free_transfers": 0,
+        "expected_valid": true,
+        "steps": [
+          {
+            "transfer_count": 15,
+            "completed_gameweek": 0,
+            "phase": "pre_season",
+            "chip": null,
+            "expected": {
+              "charged_transfers": 0,
+              "points_cost": 0,
+              "unlimited_free_transfers": true,
+              "free_transfers_next_gameweek": 1
+            }
+          }
+        ]
+      },
+      {
+        "name": "illegal_initial_bank_above_storage_cap",
+        "initial_free_transfers": 6,
+        "expected_valid": false,
+        "steps": [
+          {
+            "transfer_count": 0,
+            "completed_gameweek": 5,
+            "phase": "in_season",
+            "chip": null,
+            "expected": {}
+          }
+        ]
+      },
+      {
+        "name": "illegal_negative_transfer_count",
+        "initial_free_transfers": 1,
+        "expected_valid": false,
+        "steps": [
+          {
+            "transfer_count": -1,
+            "completed_gameweek": 5,
+            "phase": "in_season",
+            "chip": null,
+            "expected": {}
+          }
+        ]
+      }
+    ],
+    "transfer_legality_cases": [
+      {
+        "name": "legal_two_player_transfer",
+        "outgoing_player_ids": [
+          "D5",
+          "F3"
+        ],
+        "incoming_players": [
+          {
+            "player_id": "D6",
+            "position": "DEF",
+            "club_id": "FFF",
+            "price_units": 40
+          },
+          {
+            "player_id": "F4",
+            "position": "FWD",
+            "club_id": "FFF",
+            "price_units": 50
+          }
+        ],
+        "budget_limit_units": 1000,
+        "available_free_transfers": 2,
+        "completed_gameweek": 6,
+        "phase": "in_season",
+        "chip": null,
+        "expected_valid": true,
+        "expected_points_cost": 0
+      },
+      {
+        "name": "illegal_resulting_position_quota",
+        "outgoing_player_ids": [
+          "F3"
+        ],
+        "incoming_players": [
+          {
+            "player_id": "M6",
+            "position": "MID",
+            "club_id": "FFF",
+            "price_units": 50
+          }
+        ],
+        "budget_limit_units": 1000,
+        "available_free_transfers": 1,
+        "completed_gameweek": 6,
+        "phase": "in_season",
+        "chip": null,
+        "expected_valid": false
+      },
+      {
+        "name": "illegal_incoming_outgoing_count_mismatch",
+        "outgoing_player_ids": [
+          "D5",
+          "F3"
+        ],
+        "incoming_players": [
+          {
+            "player_id": "D6",
+            "position": "DEF",
+            "club_id": "FFF",
+            "price_units": 40
+          }
+        ],
+        "budget_limit_units": 1000,
+        "available_free_transfers": 2,
+        "completed_gameweek": 6,
+        "phase": "in_season",
+        "chip": null,
+        "expected_valid": false
+      }
+    ]
+  },
+  "rollover_policy": {
+    "source_rules_version": "fpl_2025_26_squad_transfer_v1",
+    "copy_mode": "explicit_reviewed_copy",
+    "unchanged_sections": [
+      "units",
+      "squad",
+      "lineup",
+      "transfers.pre_season",
+      "transfers.weekly",
+      "transfers.chip_behavior"
+    ],
+    "changed_sections": [
+      "transfers.special_events"
+    ],
+    "removed_special_events": [
+      "afcon_2025_26_gameweek_16_top_up"
+    ],
+    "target_season_special_events": [],
+    "no_silent_rule_inheritance": true
+  }
+}

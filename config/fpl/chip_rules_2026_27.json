@@ -1,0 +1,460 @@
+{
+  "schema_version": "fpl_chip_rules_v1",
+  "competition": "FPL",
+  "effective_season": "2026_27",
+  "rules_version": "fpl_2026_27_chips_v1",
+  "status": "verified_target_season_registry",
+  "source_notes": [
+    "Official 2026/27 FPL guidance confirms two sets of Wildcard, Free Hit, Triple Captain, and Bench Boost chips: one set for each half of the season.",
+    "The first-half set expires at the Gameweek 19 deadline and cannot be carried into Gameweek 20; the second-half set becomes available from Gameweek 20 through the end of the season.",
+    "Only one chip may be active in a Gameweek.",
+    "Wildcard and Free Hit cannot be played in Gameweek 1. Free Hit cannot be played in consecutive Gameweeks.",
+    "Wildcard and Free Hit are confirmed with transfers and cannot be cancelled after confirmation. Triple Captain and Bench Boost may be cancelled before the deadline.",
+    "Wildcard transfers are unlimited and permanent. Free Hit transfers are temporary and the previous squad and bank are restored at the next deadline, with price changes reflected.",
+    "Wildcard and Free Hit preserve previously banked free transfers and remove transfer-hit deductions for the active Gameweek.",
+    "There is no Assistant Manager chip in the 2026/27 registered inventory."
+  ],
+  "season": {
+    "first_gameweek": 1,
+    "last_gameweek": 38,
+    "split_after_gameweek": 19,
+    "second_half_starts_gameweek": 20
+  },
+  "global_rules": {
+    "maximum_active_chips_per_gameweek": 1,
+    "unused_first_half_inventory_carries_to_second_half": false,
+    "refresh_inventory_at_second_half": true,
+    "unsupported_chip_ids": [
+      "assistant_manager"
+    ]
+  },
+  "inventory_windows": [
+    {
+      "window_id": "first_half",
+      "available_from_gameweek": 1,
+      "available_through_gameweek": 19,
+      "expires_after_gameweek": 19,
+      "reset_behavior": "expire_unused"
+    },
+    {
+      "window_id": "second_half",
+      "available_from_gameweek": 20,
+      "available_through_gameweek": 38,
+      "expires_after_gameweek": 38,
+      "reset_behavior": "end_of_season"
+    }
+  ],
+  "chips": {
+    "wildcard": {
+      "display_name": "Wildcard",
+      "inventory_per_window": 1,
+      "playable_from_gameweek_by_window": {
+        "first_half": 2,
+        "second_half": 20
+      },
+      "playable_through_gameweek_by_window": {
+        "first_half": 19,
+        "second_half": 38
+      },
+      "activation_surface": "confirm_transfers",
+      "can_cancel_after_confirmation": false,
+      "cannot_be_used_in_gameweek_1": true,
+      "cannot_be_used_in_consecutive_gameweeks": false,
+      "effects": {
+        "captain_multiplier": 2,
+        "bench_points_count": false,
+        "unlimited_transfers": true,
+        "remove_transfer_hits": true,
+        "preserve_saved_free_transfers": true,
+        "weekly_free_transfer_accrual_after_chip": 0,
+        "temporary_squad": false,
+        "restore_previous_squad_at_next_deadline": false,
+        "restore_previous_bank_at_next_deadline": false,
+        "active_window_bank_changes_discarded": false,
+        "transfers_are_permanent": true
+      }
+    },
+    "free_hit": {
+      "display_name": "Free Hit",
+      "inventory_per_window": 1,
+      "playable_from_gameweek_by_window": {
+        "first_half": 2,
+        "second_half": 20
+      },
+      "playable_through_gameweek_by_window": {
+        "first_half": 19,
+        "second_half": 38
+      },
+      "activation_surface": "confirm_transfers",
+      "can_cancel_after_confirmation": false,
+      "cannot_be_used_in_gameweek_1": true,
+      "cannot_be_used_in_consecutive_gameweeks": true,
+      "effects": {
+        "captain_multiplier": 2,
+        "bench_points_count": false,
+        "unlimited_transfers": true,
+        "remove_transfer_hits": true,
+        "preserve_saved_free_transfers": true,
+        "weekly_free_transfer_accrual_after_chip": 0,
+        "temporary_squad": true,
+        "restore_previous_squad_at_next_deadline": true,
+        "restore_previous_bank_at_next_deadline": true,
+        "active_window_bank_changes_discarded": true,
+        "transfers_are_permanent": false
+      }
+    },
+    "triple_captain": {
+      "display_name": "Triple Captain",
+      "inventory_per_window": 1,
+      "playable_from_gameweek_by_window": {
+        "first_half": 1,
+        "second_half": 20
+      },
+      "playable_through_gameweek_by_window": {
+        "first_half": 19,
+        "second_half": 38
+      },
+      "activation_surface": "save_pick_team",
+      "can_cancel_after_confirmation": true,
+      "cannot_be_used_in_gameweek_1": false,
+      "cannot_be_used_in_consecutive_gameweeks": false,
+      "effects": {
+        "captain_multiplier": 3,
+        "bench_points_count": false,
+        "unlimited_transfers": false,
+        "remove_transfer_hits": false,
+        "preserve_saved_free_transfers": false,
+        "weekly_free_transfer_accrual_after_chip": 1,
+        "temporary_squad": false,
+        "restore_previous_squad_at_next_deadline": false,
+        "restore_previous_bank_at_next_deadline": false,
+        "active_window_bank_changes_discarded": false,
+        "transfers_are_permanent": true,
+        "vice_captain_inherits_if_captain_does_not_play": true,
+        "chip_returned_if_captain_and_vice_do_not_play": false
+      }
+    },
+    "bench_boost": {
+      "display_name": "Bench Boost",
+      "inventory_per_window": 1,
+      "playable_from_gameweek_by_window": {
+        "first_half": 1,
+        "second_half": 20
+      },
+      "playable_through_gameweek_by_window": {
+        "first_half": 19,
+        "second_half": 38
+      },
+      "activation_surface": "save_pick_team",
+      "can_cancel_after_confirmation": true,
+      "cannot_be_used_in_gameweek_1": false,
+      "cannot_be_used_in_consecutive_gameweeks": false,
+      "effects": {
+        "captain_multiplier": 2,
+        "bench_points_count": true,
+        "unlimited_transfers": false,
+        "remove_transfer_hits": false,
+        "preserve_saved_free_transfers": false,
+        "weekly_free_transfer_accrual_after_chip": 1,
+        "temporary_squad": false,
+        "restore_previous_squad_at_next_deadline": false,
+        "restore_previous_bank_at_next_deadline": false,
+        "active_window_bank_changes_discarded": false,
+        "transfers_are_permanent": true
+      }
+    }
+  },
+  "cross_registry_contract": {
+    "squad_transfer_rules_schema_version": "fpl_squad_transfer_rules_v1",
+    "required_transfer_chip_ids": [
+      "wildcard",
+      "free_hit"
+    ],
+    "fields_that_must_match": [
+      "unlimited_transfers",
+      "remove_transfer_hits",
+      "preserve_saved_free_transfers",
+      "weekly_free_transfer_accrual_after_chip",
+      "temporary_squad"
+    ]
+  },
+  "deterministic_examples": {
+    "state_examples": [
+      {
+        "example_id": "legal_first_half_mixed_usage",
+        "expected_valid": true,
+        "state": {
+          "current_gameweek": 18,
+          "active_chip": null,
+          "usage_history": [
+            {
+              "chip_id": "bench_boost",
+              "gameweek": 5
+            },
+            {
+              "chip_id": "wildcard",
+              "gameweek": 9
+            },
+            {
+              "chip_id": "triple_captain",
+              "gameweek": 14
+            },
+            {
+              "chip_id": "free_hit",
+              "gameweek": 18
+            }
+          ]
+        }
+      },
+      {
+        "example_id": "legal_second_half_refreshed_inventory",
+        "expected_valid": true,
+        "state": {
+          "current_gameweek": 24,
+          "active_chip": null,
+          "usage_history": [
+            {
+              "chip_id": "wildcard",
+              "gameweek": 8
+            },
+            {
+              "chip_id": "wildcard",
+              "gameweek": 22
+            }
+          ]
+        }
+      },
+      {
+        "example_id": "illegal_duplicate_wildcard_in_first_half",
+        "expected_valid": false,
+        "state": {
+          "current_gameweek": 12,
+          "active_chip": null,
+          "usage_history": [
+            {
+              "chip_id": "wildcard",
+              "gameweek": 3
+            },
+            {
+              "chip_id": "wildcard",
+              "gameweek": 11
+            }
+          ]
+        }
+      },
+      {
+        "example_id": "illegal_two_chips_same_gameweek",
+        "expected_valid": false,
+        "state": {
+          "current_gameweek": 10,
+          "active_chip": null,
+          "usage_history": [
+            {
+              "chip_id": "bench_boost",
+              "gameweek": 10
+            },
+            {
+              "chip_id": "triple_captain",
+              "gameweek": 10
+            }
+          ]
+        }
+      },
+      {
+        "example_id": "illegal_free_hit_gameweek_1",
+        "expected_valid": false,
+        "state": {
+          "current_gameweek": 1,
+          "active_chip": "free_hit",
+          "usage_history": [
+            {
+              "chip_id": "free_hit",
+              "gameweek": 1
+            }
+          ]
+        }
+      },
+      {
+        "example_id": "illegal_consecutive_free_hits_across_reset",
+        "expected_valid": false,
+        "state": {
+          "current_gameweek": 20,
+          "active_chip": "free_hit",
+          "usage_history": [
+            {
+              "chip_id": "free_hit",
+              "gameweek": 19
+            },
+            {
+              "chip_id": "free_hit",
+              "gameweek": 20
+            }
+          ]
+        }
+      },
+      {
+        "example_id": "illegal_unknown_chip",
+        "expected_valid": false,
+        "state": {
+          "current_gameweek": 8,
+          "active_chip": "assistant_manager",
+          "usage_history": [
+            {
+              "chip_id": "assistant_manager",
+              "gameweek": 8
+            }
+          ]
+        }
+      }
+    ],
+    "activation_examples": [
+      {
+        "example_id": "legal_bench_boost_gameweek_1",
+        "expected_valid": true,
+        "chip_id": "bench_boost",
+        "target_gameweek": 1,
+        "usage_history": []
+      },
+      {
+        "example_id": "illegal_wildcard_gameweek_1",
+        "expected_valid": false,
+        "chip_id": "wildcard",
+        "target_gameweek": 1,
+        "usage_history": []
+      },
+      {
+        "example_id": "legal_wildcard_gameweek_2",
+        "expected_valid": true,
+        "chip_id": "wildcard",
+        "target_gameweek": 2,
+        "usage_history": []
+      },
+      {
+        "example_id": "illegal_first_half_inventory_already_used",
+        "expected_valid": false,
+        "chip_id": "triple_captain",
+        "target_gameweek": 17,
+        "usage_history": [
+          {
+            "chip_id": "triple_captain",
+            "gameweek": 6
+          }
+        ]
+      },
+      {
+        "example_id": "illegal_existing_chip_same_gameweek",
+        "expected_valid": false,
+        "chip_id": "bench_boost",
+        "target_gameweek": 12,
+        "usage_history": [
+          {
+            "chip_id": "wildcard",
+            "gameweek": 12
+          }
+        ]
+      },
+      {
+        "example_id": "illegal_consecutive_free_hit",
+        "expected_valid": false,
+        "chip_id": "free_hit",
+        "target_gameweek": 20,
+        "usage_history": [
+          {
+            "chip_id": "free_hit",
+            "gameweek": 19
+          }
+        ]
+      },
+      {
+        "example_id": "legal_second_half_reset_inventory",
+        "expected_valid": true,
+        "chip_id": "wildcard",
+        "target_gameweek": 20,
+        "usage_history": [
+          {
+            "chip_id": "wildcard",
+            "gameweek": 10
+          }
+        ]
+      },
+      {
+        "example_id": "illegal_assistant_manager",
+        "expected_valid": false,
+        "chip_id": "assistant_manager",
+        "target_gameweek": 8,
+        "usage_history": []
+      }
+    ],
+    "interaction_examples": [
+      {
+        "example_id": "wildcard_permanent_unlimited_no_hits",
+        "chip_id": "wildcard",
+        "expected": {
+          "unlimited_transfers": true,
+          "remove_transfer_hits": true,
+          "preserve_saved_free_transfers": true,
+          "temporary_squad": false,
+          "transfers_are_permanent": true
+        }
+      },
+      {
+        "example_id": "free_hit_temporary_restore",
+        "chip_id": "free_hit",
+        "expected": {
+          "unlimited_transfers": true,
+          "remove_transfer_hits": true,
+          "preserve_saved_free_transfers": true,
+          "temporary_squad": true,
+          "restore_previous_squad_at_next_deadline": true,
+          "restore_previous_bank_at_next_deadline": true,
+          "transfers_are_permanent": false
+        }
+      },
+      {
+        "example_id": "triple_captain_multiplier",
+        "chip_id": "triple_captain",
+        "expected": {
+          "captain_multiplier": 3,
+          "bench_points_count": false,
+          "unlimited_transfers": false,
+          "remove_transfer_hits": false
+        }
+      },
+      {
+        "example_id": "bench_boost_bench_counts",
+        "chip_id": "bench_boost",
+        "expected": {
+          "captain_multiplier": 2,
+          "bench_points_count": true,
+          "unlimited_transfers": false,
+          "remove_transfer_hits": false
+        }
+      }
+    ]
+  },
+  "rollover_policy": {
+    "source_rules_version": "fpl_2025_26_chips_v1",
+    "copy_mode": "explicit_reviewed_copy",
+    "unchanged_sections": [
+      "season",
+      "global_rules",
+      "inventory_windows",
+      "chips",
+      "cross_registry_contract"
+    ],
+    "verified_target_season_facts": {
+      "sets_per_season": 2,
+      "chips_per_set": [
+        "wildcard",
+        "free_hit",
+        "triple_captain",
+        "bench_boost"
+      ],
+      "first_half_last_gameweek": 19,
+      "second_half_first_gameweek": 20,
+      "unused_first_half_inventory_carries": false,
+      "maximum_active_chips_per_gameweek": 1
+    },
+    "no_silent_rule_inheritance": true
+  }
+}

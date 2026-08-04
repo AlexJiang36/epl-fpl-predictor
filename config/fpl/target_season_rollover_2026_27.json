@@ -1,0 +1,231 @@
+{
+  "schema_version": "fpl_target_season_rollover_v1",
+  "rollover_version": "day76c_v1",
+  "competition": "FPL",
+  "source_season": "2025_26",
+  "target_season": "2026_27",
+  "target_gw": 1,
+  "fixture_scope": {
+    "first_gameweek": 1,
+    "last_gameweek": 5,
+    "expected_fixtures_per_gameweek": 10
+  },
+  "source_team_short_names": [
+    "ARS",
+    "AVL",
+    "BOU",
+    "BRE",
+    "BHA",
+    "BUR",
+    "CHE",
+    "CRY",
+    "EVE",
+    "FUL",
+    "LEE",
+    "LIV",
+    "MCI",
+    "MUN",
+    "NEW",
+    "NFO",
+    "SUN",
+    "TOT",
+    "WHU",
+    "WOL"
+  ],
+  "target_team_short_names": [
+    "ARS",
+    "AVL",
+    "BOU",
+    "BRE",
+    "BHA",
+    "CHE",
+    "COV",
+    "CRY",
+    "EVE",
+    "FUL",
+    "HUL",
+    "IPS",
+    "LEE",
+    "LIV",
+    "MCI",
+    "MUN",
+    "NEW",
+    "NFO",
+    "SUN",
+    "TOT"
+  ],
+  "promoted_team_short_names": [
+    "COV",
+    "HUL",
+    "IPS"
+  ],
+  "relegated_team_short_names": [
+    "BUR",
+    "WHU",
+    "WOL"
+  ],
+  "unchanged_team_short_names": [
+    "ARS",
+    "AVL",
+    "BOU",
+    "BRE",
+    "BHA",
+    "CHE",
+    "CRY",
+    "EVE",
+    "FUL",
+    "LEE",
+    "LIV",
+    "MCI",
+    "MUN",
+    "NEW",
+    "NFO",
+    "SUN",
+    "TOT"
+  ],
+  "position_changes": [
+    {
+      "player_name": "Myles Lewis-Skelly",
+      "team_short_name": "ARS",
+      "old_position": "DEF",
+      "new_position": "MID",
+      "web_name": "Lewis-Skelly"
+    },
+    {
+      "player_name": "Lamare Bogarde",
+      "team_short_name": "AVL",
+      "old_position": "DEF",
+      "new_position": "MID",
+      "web_name": "Bogarde"
+    },
+    {
+      "player_name": "Junior Kroupi",
+      "team_short_name": "BOU",
+      "old_position": "FWD",
+      "new_position": "MID",
+      "web_name": "Kroupi"
+    },
+    {
+      "player_name": "Keane Lewis-Potter",
+      "team_short_name": "BRE",
+      "old_position": "DEF",
+      "new_position": "MID",
+      "web_name": "Lewis-Potter"
+    },
+    {
+      "player_name": "Mats Wieffer",
+      "team_short_name": "BHA",
+      "old_position": "MID",
+      "new_position": "DEF",
+      "web_name": "Wieffer"
+    },
+    {
+      "player_name": "Georginio Rutter",
+      "team_short_name": "BHA",
+      "old_position": "MID",
+      "new_position": "FWD",
+      "web_name": "Rutter"
+    },
+    {
+      "player_name": "Rio Cardines",
+      "team_short_name": "CRY",
+      "old_position": "MID",
+      "new_position": "DEF",
+      "web_name": "Cardines"
+    },
+    {
+      "player_name": "Ryan Sessegnon",
+      "team_short_name": "FUL",
+      "old_position": "MID",
+      "new_position": "DEF",
+      "web_name": "Sessegnon"
+    },
+    {
+      "player_name": "Omar Marmoush",
+      "team_short_name": "MCI",
+      "old_position": "MID",
+      "new_position": "FWD",
+      "web_name": "Marmoush"
+    },
+    {
+      "player_name": "Patrick Dorgu",
+      "team_short_name": "MUN",
+      "old_position": "DEF",
+      "new_position": "MID",
+      "web_name": "Dorgu"
+    },
+    {
+      "player_name": "Eric Moreira",
+      "team_short_name": "NFO",
+      "old_position": "MID",
+      "new_position": "DEF",
+      "web_name": "Moreira"
+    }
+  ],
+  "required_rule_versions": {
+    "scoring": "fpl_2026_27_scoring_v1",
+    "squad_transfer": "fpl_2026_27_squad_transfer_v1",
+    "chips": "fpl_2026_27_chips_v1",
+    "bonus_points_system": "fpl_2026_27_bps_v1"
+  },
+  "mapping_policy": {
+    "automatic_player_match_methods": [
+      "unique_exact_normalized_full_name",
+      "unique_exact_web_name_with_unchanged_team"
+    ],
+    "fuzzy_auto_approval_allowed": false,
+    "unresolved_target_player_historical_prior_eligible": false,
+    "target_position_is_authoritative": true,
+    "unlisted_exact_mapped_position_change_is_blocking": true,
+    "configured_position_change_target_absent_policy": "warning_not_blocker_until_player_appears_in_current_pool",
+    "configured_position_change_target_present_unverified_policy": "blocker"
+  },
+  "official_sources": [
+    {
+      "purpose": "target_team_transition",
+      "url": "https://www.premierleague.com/en/news/4673099/the-202627-premier-league-season-officially-starts/"
+    },
+    {
+      "purpose": "position_changes",
+      "url": "https://www.premierleague.com/en/news/4679886/position-changes-for-202627-fantasy-premier-league/"
+    },
+    {
+      "purpose": "bonus_points_system",
+      "url": "https://www.premierleague.com/en/news/4679946/whats-new-in-202627-fantasy-changes-to-bonus-points-system"
+    },
+    {
+      "purpose": "defensive_contributions",
+      "url": "https://www.premierleague.com/en/news/4361991/whats-happening-with-defensive-contribution-points-in-202627-fantasy"
+    },
+    {
+      "purpose": "chips",
+      "url": "https://www.premierleague.com/en/news/4679879/whats-happening-with-fpl-chips-in-202627"
+    },
+    {
+      "purpose": "live_player_pool",
+      "url": "https://fantasy.premierleague.com/api/bootstrap-static/"
+    },
+    {
+      "purpose": "live_fixtures",
+      "url": "https://fantasy.premierleague.com/api/fixtures/"
+    }
+  ],
+  "safety": {
+    "audit_only": true,
+    "writes_database": false,
+    "ready_for_prediction_write": false,
+    "fail_closed_on": [
+      "target_season_mismatch",
+      "target_gw_mismatch",
+      "missing_player_identity",
+      "missing_player_price",
+      "missing_player_position",
+      "missing_player_availability",
+      "team_set_mismatch",
+      "fixture_scope_gap",
+      "rule_version_mismatch",
+      "unsafe_identity_mapping",
+      "position_change_mismatch"
+    ]
+  }
+}
