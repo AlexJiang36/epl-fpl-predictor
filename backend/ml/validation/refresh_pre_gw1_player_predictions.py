@@ -201,10 +201,29 @@ def adapt_current_player_pool(current_players: pd.DataFrame) -> pd.DataFrame:
             "target_position",
             "target_price",
             "target_status",
+            "chance_of_playing_next_round",
+            "news",
+            "news_added",
             "current_selection_eligible",
         ),
         "Day76C current player pool",
     )
+    raw_chance = current_players["chance_of_playing_next_round"]
+    chance = pd.to_numeric(raw_chance, errors="coerce")
+    has_raw_chance = (
+        raw_chance.notna()
+        & raw_chance.astype(str).str.strip().ne("")
+    )
+    invalid_chance = has_raw_chance & chance.isna()
+    out_of_range_chance = chance.notna() & (
+        (chance < 0.0) | (chance > 100.0)
+    )
+    if invalid_chance.any() or out_of_range_chance.any():
+        raise Day76DInputError(
+            "Day76C current player pool contains invalid "
+            "chance_of_playing_next_round values; expected null or 0..100."
+        )
+
     result = pd.DataFrame(
         {
             "player_id": current_players["target_player_id"].apply(nullable_int),
@@ -215,6 +234,9 @@ def adapt_current_player_pool(current_players: pd.DataFrame) -> pd.DataFrame:
             "position": current_players["target_position"].astype(str).str.upper(),
             "price": pd.to_numeric(current_players["target_price"], errors="coerce"),
             "status": current_players["target_status"].fillna("").astype(str),
+            "chance_of_playing_next_round": chance,
+            "news": current_players["news"].fillna("").astype(str),
+            "news_added": current_players["news_added"].fillna("").astype(str),
             "current_selection_eligible": current_players[
                 "current_selection_eligible"
             ].apply(bool_value),
@@ -1290,6 +1312,7 @@ def main() -> None:
                 "--prediction-mode", "auto",
                 "--player-features-csv", str(paths["player_features_csv"]),
                 "--day71a-json", str(paths["player_features_json"]),
+                "--player-feature-version", DAY71A_FEATURE_VERSION,
                 "--scoring-rules-version", scoring_rules_version,
                 "--transfer-rules-version", squad_transfer_rules_version,
                 "--chip-rules-version", chip_rules_version,
@@ -1309,8 +1332,10 @@ def main() -> None:
                 "--target-gw", str(target_gw),
                 "--as-of-time", as_of_time,
                 "--prediction-mode", "auto",
+                "--player-feature-version", DAY71A_FEATURE_VERSION,
                 "--player-features-csv", str(paths["player_features_csv"]),
                 "--day71a-json", str(paths["player_features_json"]),
+                "--player-feature-version", DAY71A_FEATURE_VERSION,
                 "--day71b-json", str(paths["role_contract_json"]),
                 "--scoreline-preview-csv", str(paths["scoreline_csv"]),
                 "--day70c-json", str(paths["scoreline_json"]),

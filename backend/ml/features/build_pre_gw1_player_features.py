@@ -13,7 +13,7 @@ from app.core.db import SessionLocal
 from ml.validation.resolve_prediction_mode import resolve_prediction_mode
 
 
-FEATURE_VERSION = "day71a_v0"
+FEATURE_VERSION = "day71a_v0_1"
 FEATURE_SCOPE = "pre_gw1_player_features"
 PROMOTED_TEAM_SHORT_NAMES = {"BUR", "LEE", "SUN"}
 
@@ -34,6 +34,9 @@ OUTPUT_COLUMNS = [
     "position",
     "price",
     "status",
+    "chance_of_playing_next_round",
+    "news",
+    "news_added",
     "has_fixture",
     "fixture_id",
     "fpl_fixture_id",

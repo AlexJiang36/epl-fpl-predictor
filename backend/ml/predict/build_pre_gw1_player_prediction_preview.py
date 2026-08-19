@@ -22,7 +22,7 @@ from ml.validation.resolve_prediction_mode import resolve_prediction_mode
 
 
 MODEL_NAME = "pre_gw1_player_prior_heuristic_v0"
-MODEL_VERSION = "day72a_v0_1"
+MODEL_VERSION = "day72a_v0_2"
 PREDICTION_SCOPE = "read_only_pre_gw1_player_prediction_preview"
 ARTIFACT_TYPE = "pre_gw1_player_prediction_preview"
 COMPONENT_ACCOUNTING_STATUS = "heuristic_components_reconciled_to_final_points"
@@ -146,6 +146,9 @@ REQUIRED_PLAYER_FEATURE_COLUMNS = [
     "position",
     "price",
     "status",
+    "chance_of_playing_next_round",
+    "news",
+    "news_added",
     "has_fixture",
     "fixture_id",
     "fpl_fixture_id",
@@ -236,6 +239,12 @@ REQUIRED_OUTPUT_COLUMNS = [
     "position",
     "price",
     "now_cost",
+    "chance_of_playing_next_round",
+    "news",
+    "news_added",
+    "official_availability_probability",
+    "official_availability_workload_factor",
+    "official_availability_adjustment_applied",
     "fixture_id",
     "opponent_team_id",
     "opponent_short_name",
@@ -348,7 +357,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--scoreline-preview-csv", required=True)
     parser.add_argument("--day70c-json", default="")
 
-    parser.add_argument("--player-feature-version", default="day71a_v0")
+    parser.add_argument("--player-feature-version", default="day71a_v0_1")
     parser.add_argument(
         "--role-contract-version",
         default=DAY71B_CONTRACT_VERSION,
@@ -452,6 +461,75 @@ def nullable_int(value: Any) -> Optional[int]:
 
 def clamp(value: float, low: float, high: float) -> float:
     return max(low, min(high, value))
+
+
+def apply_official_availability_adjustment(
+    appearance_probability: float,
+    start_probability: float,
+    expected_minutes: float,
+    chance_of_playing_next_round: Any,
+) -> Dict[str, Any]:
+    """Apply official FPL availability as a conservative workload ceiling.
+
+    A non-null official percentage may reduce the model's unconditional
+    appearance probability. It never raises a more conservative model estimate.
+    When the official ceiling binds, start probability and expected minutes are
+    scaled by the same factor so the existing conditional role assumption is
+    preserved.
+    """
+    baseline_appearance = clamp(float(appearance_probability), 0.0, 1.0)
+    baseline_start = clamp(
+        float(start_probability),
+        0.0,
+        baseline_appearance,
+    )
+    baseline_minutes = clamp(float(expected_minutes), 0.0, 90.0)
+    chance_percent = nullable_float(chance_of_playing_next_round)
+
+    result: Dict[str, Any] = {
+        "appearance_probability": baseline_appearance,
+        "start_probability": baseline_start,
+        "expected_minutes": baseline_minutes,
+        "official_availability_probability": None,
+        "official_availability_workload_factor": 1.0,
+        "official_availability_adjustment_applied": False,
+    }
+
+    if chance_percent is None:
+        return result
+    if chance_percent < 0.0 or chance_percent > 100.0:
+        raise RuntimeError(
+            "chance_of_playing_next_round must be null or within 0..100."
+        )
+
+    official_probability = chance_percent / 100.0
+    result["official_availability_probability"] = official_probability
+
+    if (
+        baseline_appearance <= 1e-12
+        or official_probability >= baseline_appearance - 1e-12
+    ):
+        return result
+
+    workload_factor = official_probability / baseline_appearance
+    result.update(
+        {
+            "appearance_probability": official_probability,
+            "start_probability": clamp(
+                baseline_start * workload_factor,
+                0.0,
+                official_probability,
+            ),
+            "expected_minutes": clamp(
+                baseline_minutes * workload_factor,
+                0.0,
+                90.0,
+            ),
+            "official_availability_workload_factor": workload_factor,
+            "official_availability_adjustment_applied": True,
+        }
+    )
+    return result
 
 
 def sha256_file(path_value: str) -> Optional[str]:
@@ -1200,6 +1278,7 @@ def build_preview(
     scoreline_fallback_player_rows = 0
     guardrail_clipped_rows = 0
     goalkeeper_competition_adjusted_rows = 0
+    official_availability_adjusted_rows = 0
 
     source_seasons_value = ",".join(args.source_seasons)
 
@@ -1304,6 +1383,30 @@ def build_preview(
 
         appearance_probability = clamp(appearance_probability, 0.0, 1.0)
         start_probability = clamp(start_probability, 0.0, appearance_probability)
+
+        availability_adjustment = apply_official_availability_adjustment(
+            appearance_probability=appearance_probability,
+            start_probability=start_probability,
+            expected_minutes=expected_minutes,
+            chance_of_playing_next_round=(
+                row.get("chance_of_playing_next_round")
+                if status_cutoff_valid
+                else None
+            ),
+        )
+        appearance_probability = float(
+            availability_adjustment["appearance_probability"]
+        )
+        start_probability = float(
+            availability_adjustment["start_probability"]
+        )
+        expected_minutes = float(
+            availability_adjustment["expected_minutes"]
+        )
+        if availability_adjustment[
+            "official_availability_adjustment_applied"
+        ]:
+            official_availability_adjusted_rows += 1
 
         points_per90 = blended_value(
             nullable_float(row.get("points_per90_proxy")),
@@ -1421,6 +1524,13 @@ def build_preview(
             scoreline_fallback=scoreline_fallback,
             status_cutoff_valid=status_cutoff_valid,
         )
+        if (
+            availability_adjustment[
+                "official_availability_adjustment_applied"
+            ]
+            and "official_availability_adjusted_flag" not in risks
+        ):
+            risks.append("official_availability_adjusted_flag")
 
         role_confidence = base_role_confidence(sample_tier)
         if fallback["fallback_level"] == 5:
@@ -1539,6 +1649,38 @@ def build_preview(
             "price": round(float(row.get("price_numeric")), 1),
             "now_cost": int(round(float(row.get("price_numeric")) * 10.0)),
             "status": row.get("status"),
+            "chance_of_playing_next_round": nullable_float(
+                row.get("chance_of_playing_next_round")
+            ),
+            "news": row.get("news"),
+            "news_added": row.get("news_added"),
+            "official_availability_probability": (
+                None
+                if availability_adjustment[
+                    "official_availability_probability"
+                ] is None
+                else round(
+                    float(
+                        availability_adjustment[
+                            "official_availability_probability"
+                        ]
+                    ),
+                    6,
+                )
+            ),
+            "official_availability_workload_factor": round(
+                float(
+                    availability_adjustment[
+                        "official_availability_workload_factor"
+                    ]
+                ),
+                6,
+            ),
+            "official_availability_adjustment_applied": bool(
+                availability_adjustment[
+                    "official_availability_adjustment_applied"
+                ]
+            ),
             "fixture_id": nullable_int(row.get("fixture_id")),
             "fpl_fixture_id": nullable_int(row.get("fpl_fixture_id")),
             "opponent_team_id": nullable_int(row.get("opponent_team_id")),
@@ -1672,6 +1814,9 @@ def build_preview(
         "guardrail_clipped_rows": guardrail_clipped_rows,
         "goalkeeper_competition_adjusted_rows": (
             goalkeeper_competition_adjusted_rows
+        ),
+        "official_availability_adjusted_rows": (
+            official_availability_adjusted_rows
         ),
         "max_gkp_team_appearance_probability_sum": round(
             max_gkp_team_appearance_probability_sum,

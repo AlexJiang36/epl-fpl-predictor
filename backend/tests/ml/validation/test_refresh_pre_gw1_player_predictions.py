@@ -5,6 +5,9 @@ from types import SimpleNamespace
 
 import pandas as pd
 
+from ml.predict.build_pre_gw1_player_prediction_preview import (
+    apply_official_availability_adjustment,
+)
 from ml.validation.refresh_pre_gw1_player_predictions import (
     Day76DInputError,
     PREDICTION_SOURCE,
@@ -72,7 +75,20 @@ class Day76DRefreshTests(unittest.TestCase):
                     "target_team_short_name": "T%02d" % team_id,
                     "target_position": "GKP" if team_id == 1 else "MID",
                     "target_price": 5.0,
-                    "target_status": "a",
+                    "target_status": "d" if team_id == 2 else "a",
+                    "chance_of_playing_next_round": (
+                        75.0 if team_id == 2 else None
+                    ),
+                    "news": (
+                        "Knock - 75% chance of playing"
+                        if team_id == 2
+                        else ""
+                    ),
+                    "news_added": (
+                        "2026-08-09T08:30:05Z"
+                        if team_id == 2
+                        else ""
+                    ),
                     "current_selection_eligible": team_id != 20,
                 }
             )
@@ -100,7 +116,105 @@ class Day76DRefreshTests(unittest.TestCase):
         self.assertEqual(result.loc[0, "player_id"], 1)
         self.assertEqual(result.loc[0, "fpl_player_id"], 1)
         self.assertEqual(result.loc[0, "position"], "GKP")
+        self.assertAlmostEqual(
+            float(result.loc[1, "chance_of_playing_next_round"]),
+            75.0,
+        )
+        self.assertEqual(
+            result.loc[1, "news"],
+            "Knock - 75% chance of playing",
+        )
+        self.assertEqual(
+            result.loc[1, "news_added"],
+            "2026-08-09T08:30:05Z",
+        )
         self.assertFalse(bool(result.loc[19, "current_selection_eligible"]))
+
+    def test_current_player_pool_adapter_rejects_invalid_chance(self) -> None:
+        players = self.player_pool()
+        players.loc[1, "chance_of_playing_next_round"] = 125.0
+        with self.assertRaisesRegex(
+            Day76DInputError,
+            "chance_of_playing_next_round",
+        ):
+            adapt_current_player_pool(players)
+
+    def test_official_availability_caps_and_scales_workload(self) -> None:
+        result = apply_official_availability_adjustment(
+            appearance_probability=0.838158,
+            start_probability=0.8,
+            expected_minutes=72.5921,
+            chance_of_playing_next_round=75.0,
+        )
+        expected_factor = 0.75 / 0.838158
+        self.assertTrue(
+            result["official_availability_adjustment_applied"]
+        )
+        self.assertAlmostEqual(
+            result["appearance_probability"],
+            0.75,
+        )
+        self.assertAlmostEqual(
+            result["start_probability"],
+            0.8 * expected_factor,
+        )
+        self.assertAlmostEqual(
+            result["expected_minutes"],
+            72.5921 * expected_factor,
+        )
+        self.assertAlmostEqual(
+            result["official_availability_probability"],
+            0.75,
+        )
+
+    def test_official_availability_never_increases_workload(self) -> None:
+        result = apply_official_availability_adjustment(
+            appearance_probability=0.60,
+            start_probability=0.50,
+            expected_minutes=48.0,
+            chance_of_playing_next_round=75.0,
+        )
+        self.assertFalse(
+            result["official_availability_adjustment_applied"]
+        )
+        self.assertAlmostEqual(
+            result["appearance_probability"],
+            0.60,
+        )
+        self.assertAlmostEqual(
+            result["start_probability"],
+            0.50,
+        )
+        self.assertAlmostEqual(
+            result["expected_minutes"],
+            48.0,
+        )
+
+    def test_missing_official_availability_leaves_workload_unchanged(self) -> None:
+        result = apply_official_availability_adjustment(
+            appearance_probability=0.80,
+            start_probability=0.70,
+            expected_minutes=65.0,
+            chance_of_playing_next_round=None,
+        )
+        self.assertFalse(
+            result["official_availability_adjustment_applied"]
+        )
+        self.assertIsNone(
+            result["official_availability_probability"]
+        )
+        self.assertAlmostEqual(
+            result["appearance_probability"],
+            0.80,
+        )
+        self.assertAlmostEqual(
+            result["start_probability"],
+            0.70,
+        )
+        self.assertAlmostEqual(
+            result["expected_minutes"],
+            65.0,
+        )
 
     def test_target_team_adapter_requires_twenty_teams(self) -> None:
         result = adapt_target_teams(self.player_pool())
