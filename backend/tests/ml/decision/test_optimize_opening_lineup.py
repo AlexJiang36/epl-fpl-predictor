@@ -8,7 +8,10 @@ import pandas as pd
 from ml.contracts.opening_squad import build_default_opening_squad_objective_policy
 from ml.decision.optimize_opening_lineup import (
     OpeningLineupOptimizerError,
+    build_markdown_report,
+    build_report,
     optimize_complete_lineup,
+    player_lookup,
     validate_day101a_report,
 )
 from ml.decision.squad_rules import SquadLegalityEngine
@@ -105,9 +108,17 @@ class Day101BOpeningLineupOptimizerTests(unittest.TestCase):
             "writes_squad_state": False,
             "target_season": TARGET_SEASON,
             "target_gw": 1,
+            "requested_horizon": 5,
+            "effective_horizon": 1,
+            "objective_mode": "gw1_only_fallback",
+            "as_of_time_utc": "2026-08-18T04:04:45Z",
+            "source_day97a_run_id": "day97a",
+            "run_metadata": {"run_id": "day101a"},
             "variants": {
                 "primary": {
                     "selected_player_ids": list(range(1, 16)),
+                    "total_cost_units": 750,
+                    "bank_units": 250,
                     "squad_legality": {"valid": True},
                     "objective_reconciliation": {"passed": True},
                     "objective_policy": self.policy.to_dict(),
@@ -231,6 +242,33 @@ class Day101BOpeningLineupOptimizerTests(unittest.TestCase):
                 first[name]["vice_captain_player_id"],
                 second[name]["vice_captain_player_id"],
             )
+
+    def test_report_records_upstream_availability_propagation_without_double_penalty(self):
+        squad = self.make_fixed_squad()
+        projections = self.make_projections()
+        plans = self.optimize()
+        report = build_report(
+            source_report=self.safe_day101a_report(),
+            run_metadata={"run_id": "day101b"},
+            plans=plans,
+            lookup=player_lookup(squad, projections),
+            policy=self.policy,
+            engine=self.engine,
+            source_metadata={},
+        )
+
+        scope = report["availability_scope"]
+        self.assertTrue(scope["official_chance_of_playing_next_round_propagated"])
+        self.assertTrue(scope["official_availability_consumed_via_adjusted_projection_inputs"])
+        self.assertFalse(scope["day101b_additional_official_availability_penalty_applied"])
+        self.assertIsNone(scope["required_follow_up"])
+        self.assertFalse(
+            any("availability propagation gap" in warning for warning in report["warnings"])
+        )
+
+        markdown = build_markdown_report(report)
+        self.assertIn("propagated upstream before Day101B", markdown)
+        self.assertNotIn("not yet propagated end-to-end", markdown)
 
 
 if __name__ == "__main__":
