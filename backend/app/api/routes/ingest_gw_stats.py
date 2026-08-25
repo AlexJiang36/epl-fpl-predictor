@@ -1,13 +1,15 @@
+from typing import Any, Dict, List
+
 import httpx
 from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.core.season import get_current_season
+from app.models.gameweek import Gameweek
 from app.models.player import Player
 from app.models.player_gw_stat import PlayerGameweekStat
-from app.models.gameweek import Gameweek
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
@@ -16,17 +18,23 @@ def fpl_event_live_url(gw: int) -> str:
     return f"https://fantasy.premierleague.com/api/event/{gw}/live/"
 
 
-def ingest_one_gw(db: Session, gw: int, season: str) -> dict:
-    data = httpx.get(fpl_event_live_url(gw), timeout=30).json()
+def ingest_one_gw_document(
+    db: Session,
+    gw: int,
+    season: str,
+    data: Dict[str, Any],
+) -> dict:
     elements = data.get("elements", [])
 
-    players = db.execute(select(Player.id, Player.fpl_player_id)).all()
+    players = db.execute(
+        select(Player.id, Player.fpl_player_id).where(Player.season == season)
+    ).all()
     fpl_to_player_id = {fpl_id: pid for (pid, fpl_id) in players}
 
     inserted = 0
     updated = 0
     skipped = 0
-    skipped_ids = []
+    skipped_ids: List[int] = []
 
     for e in elements:
         fpl_player_id = int(e["id"])
@@ -100,6 +108,17 @@ def ingest_one_gw(db: Session, gw: int, season: str) -> dict:
     if skipped > 0:
         result["skipped_ids"] = skipped_ids[:20]
     return result
+
+
+def ingest_one_gw(db: Session, gw: int, season: str) -> dict:
+    response = httpx.get(fpl_event_live_url(gw), timeout=30)
+    response.raise_for_status()
+    return ingest_one_gw_document(
+        db=db,
+        gw=gw,
+        season=season,
+        data=response.json(),
+    )
 
 
 @router.post("/fpl/gw/{gw}/live")

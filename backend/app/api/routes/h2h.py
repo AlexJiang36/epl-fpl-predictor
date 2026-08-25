@@ -49,6 +49,7 @@ def head_to_head(
     # Team name lookup (optional but nice).
     team_rows = (
         db.query(Team.id, Team.name)
+        .filter(Team.season == resolved_season)
         .filter(Team.id.in_([home_team_id, away_team_id]))
         .all()
     )

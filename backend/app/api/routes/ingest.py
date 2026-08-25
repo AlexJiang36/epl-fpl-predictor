@@ -1,27 +1,24 @@
-from typing import Optional
 from datetime import datetime
-import httpx
+from typing import Any, Dict, List, Optional
 
+import httpx
 from fastapi import APIRouter, Depends
-from sqlalchemy.orm import Session
 from sqlalchemy import select
+from sqlalchemy.orm import Session
 
 from app.core.db import get_db
 from app.core.season import get_current_season
-from app.services.fpl_client import fetch_bootstrap
-from app.models.team import Team
-from app.models.player import Player
 from app.models.fixture import Fixture
+from app.models.player import Player
+from app.models.team import Team
+from app.services.fpl_client import fetch_bootstrap
 
 router = APIRouter(prefix="/ingest", tags=["ingest"])
 
 FPL_FIXTURES_URL = "https://fantasy.premierleague.com/api/fixtures/"
 
 
-@router.post("/fpl/bootstrap")
-def ingest_fpl_bootstrap(db: Session = Depends(get_db)):
-    data = fetch_bootstrap()
-
+def ingest_bootstrap_document(db: Session, data: Dict[str, Any], season: str) -> Dict[str, Any]:
     teams_data = data.get("teams", [])
     players_data = data.get("elements", [])
 
@@ -34,11 +31,21 @@ def ingest_fpl_bootstrap(db: Session = Depends(get_db)):
         short_name = t.get("short_name") or name
 
         existing = db.execute(
-            select(Team).where(Team.fpl_team_id == fpl_team_id)
+            select(Team).where(
+                Team.season == season,
+                Team.fpl_team_id == fpl_team_id,
+            )
         ).scalar_one_or_none()
 
         if existing is None:
-            db.add(Team(fpl_team_id=fpl_team_id, name=name, short_name=short_name))
+            db.add(
+                Team(
+                    season=season,
+                    fpl_team_id=fpl_team_id,
+                    name=name,
+                    short_name=short_name,
+                )
+            )
             inserted_teams += 1
         else:
             changed = False
@@ -51,13 +58,18 @@ def ingest_fpl_bootstrap(db: Session = Depends(get_db)):
             if changed:
                 updated_teams += 1
 
+    # Player rows need the DB primary keys of the season-scoped Team rows.
     db.commit()
 
-    team_rows = db.execute(select(Team)).scalars().all()
+    team_rows = db.execute(
+        select(Team).where(Team.season == season)
+    ).scalars().all()
     team_map = {t.fpl_team_id: t.id for t in team_rows}
 
     inserted_players = 0
     updated_players = 0
+    skipped_players = 0
+    skipped_player_ids: List[int] = []
 
     pos_map = {1: "GKP", 2: "DEF", 3: "MID", 4: "FWD"}
 
@@ -69,18 +81,26 @@ def ingest_fpl_bootstrap(db: Session = Depends(get_db)):
 
         fpl_team_id = int(p["team"])
         team_id = team_map.get(fpl_team_id)
+        if team_id is None:
+            skipped_players += 1
+            skipped_player_ids.append(fpl_player_id)
+            continue
 
         position = pos_map.get(int(p["element_type"]), "UNK")
         now_cost = int(p["now_cost"])
         status = str(p["status"])
 
         existing = db.execute(
-            select(Player).where(Player.fpl_player_id == fpl_player_id)
+            select(Player).where(
+                Player.season == season,
+                Player.fpl_player_id == fpl_player_id,
+            )
         ).scalar_one_or_none()
 
         if existing is None:
             db.add(
                 Player(
+                    season=season,
                     fpl_player_id=fpl_player_id,
                     first_name=first_name,
                     second_name=second_name,
@@ -121,7 +141,8 @@ def ingest_fpl_bootstrap(db: Session = Depends(get_db)):
 
     db.commit()
 
-    return {
+    result: Dict[str, Any] = {
+        "season": season,
         "teams": {
             "inserted": inserted_teams,
             "updated": updated_teams,
@@ -130,9 +151,20 @@ def ingest_fpl_bootstrap(db: Session = Depends(get_db)):
         "players": {
             "inserted": inserted_players,
             "updated": updated_players,
+            "skipped": skipped_players,
             "total_source": len(players_data),
         },
     }
+    if skipped_player_ids:
+        result["players"]["skipped_ids"] = skipped_player_ids[:20]
+    return result
+
+
+@router.post("/fpl/bootstrap")
+def ingest_fpl_bootstrap(db: Session = Depends(get_db)):
+    season = get_current_season()
+    data = fetch_bootstrap()
+    return ingest_bootstrap_document(db=db, data=data, season=season)
 
 
 def parse_dt(s: Optional[str]) -> Optional[datetime]:
@@ -143,18 +175,16 @@ def parse_dt(s: Optional[str]) -> Optional[datetime]:
     return datetime.fromisoformat(s)
 
 
-@router.post("/fpl/fixtures")
-def ingest_fpl_fixtures(db: Session = Depends(get_db)):
-    season = get_current_season()
-
-    fixtures = httpx.get(FPL_FIXTURES_URL, timeout=30).json()
-
-    teams = db.execute(select(Team)).scalars().all()
+def ingest_fixture_document(db: Session, fixtures: List[Dict[str, Any]], season: str) -> Dict[str, Any]:
+    teams = db.execute(
+        select(Team).where(Team.season == season)
+    ).scalars().all()
     team_map = {t.fpl_team_id: t.id for t in teams}
 
     inserted = 0
     updated = 0
     skipped = 0
+    skipped_fixture_ids: List[int] = []
 
     for fx in fixtures:
         fpl_fixture_id = int(fx["id"])
@@ -167,6 +197,7 @@ def ingest_fpl_fixtures(db: Session = Depends(get_db)):
 
         if home_team_id is None or away_team_id is None:
             skipped += 1
+            skipped_fixture_ids.append(fpl_fixture_id)
             continue
 
         kickoff_time = parse_dt(fx.get("kickoff_time"))
@@ -228,7 +259,7 @@ def ingest_fpl_fixtures(db: Session = Depends(get_db)):
 
     db.commit()
 
-    return {
+    result: Dict[str, Any] = {
         "season": season,
         "fixtures": {
             "inserted": inserted,
@@ -237,3 +268,15 @@ def ingest_fpl_fixtures(db: Session = Depends(get_db)):
             "total_source": len(fixtures),
         },
     }
+    if skipped_fixture_ids:
+        result["fixtures"]["skipped_ids"] = skipped_fixture_ids[:20]
+    return result
+
+
+@router.post("/fpl/fixtures")
+def ingest_fpl_fixtures(db: Session = Depends(get_db)):
+    season = get_current_season()
+    response = httpx.get(FPL_FIXTURES_URL, timeout=30)
+    response.raise_for_status()
+    fixtures = response.json()
+    return ingest_fixture_document(db=db, fixtures=fixtures, season=season)

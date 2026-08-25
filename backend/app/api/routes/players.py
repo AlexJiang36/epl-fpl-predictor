@@ -1,14 +1,16 @@
 from typing import Optional
 
 from fastapi import APIRouter, Depends, Query
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
-from sqlalchemy import select, func
 
 from app.core.db import get_db
+from app.core.season import get_current_season
 from app.models.player import Player
 
 
 router = APIRouter(prefix="/players", tags=["players"])
+
 
 @router.get("")
 def list_players(
@@ -20,12 +22,13 @@ def list_players(
     db: Session = Depends(get_db),
 ):
     """
-    List players with optional filters:
+    List current-season players with optional filters:
     - position: GKP/DEF/MID/FWD
     - team_id: integer team id in our DB
     - search: partial match on web_name
     """
-    stmt = select(Player)
+    season = get_current_season()
+    stmt = select(Player).where(Player.season == season)
 
     if position is not None:
         stmt = stmt.where(Player.position == position)
@@ -39,14 +42,19 @@ def list_players(
     total = db.execute(select(func.count()).select_from(stmt.subquery())).scalar_one()
 
     stmt = stmt.order_by(Player.id).offset(offset).limit(limit)
-
     players = db.execute(stmt).scalars().all()
 
     return {
-        "meta": {"total": total, "limit": limit, "offset": offset},
+        "meta": {
+            "season": season,
+            "total": total,
+            "limit": limit,
+            "offset": offset,
+        },
         "players": [
             {
                 "id": p.id,
+                "season": p.season,
                 "fpl_player_id": p.fpl_player_id,
                 "first_name": p.first_name,
                 "second_name": p.second_name,
@@ -57,5 +65,5 @@ def list_players(
                 "status": p.status,
             }
             for p in players
-        ]
+        ],
     }

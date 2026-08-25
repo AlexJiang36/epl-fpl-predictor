@@ -71,7 +71,7 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help=(
             "Allow direct mapping from the player key column to current database player IDs or "
-            "fpl_player_id. Use only when you have confirmed the historical IDs are safe."
+            "season-scoped fpl_player_id. Use only when you have confirmed the historical IDs are safe."
         ),
     )
     parser.add_argument(
@@ -383,7 +383,7 @@ def get_existing_ids(table_name: str, id_column: str) -> set:
         db.close()
 
 
-def get_player_fpl_id_to_id() -> Dict[str, int]:
+def get_player_fpl_id_to_id(season: str) -> Dict[str, int]:
     if not table_exists("players"):
         return {}
 
@@ -393,7 +393,23 @@ def get_player_fpl_id_to_id() -> Dict[str, int]:
 
     db = SessionLocal()
     try:
-        rows = db.execute(text("SELECT id, fpl_player_id FROM players WHERE fpl_player_id IS NOT NULL")).fetchall()
+        if "season" in columns:
+            rows = db.execute(
+                text(
+                    "SELECT id, fpl_player_id FROM players "
+                    "WHERE season = :season AND fpl_player_id IS NOT NULL"
+                ),
+                {"season": season},
+            ).fetchall()
+        else:
+            # Backward compatibility for a pre-seasonized schema. This branch
+            # should disappear once the live-entity migration is universally applied.
+            rows = db.execute(
+                text(
+                    "SELECT id, fpl_player_id FROM players "
+                    "WHERE fpl_player_id IS NOT NULL"
+                )
+            ).fetchall()
         return {normalize_key(row[1]): int(row[0]) for row in rows}
     finally:
         db.close()
@@ -446,6 +462,7 @@ def build_team_mapping(
 
 def build_player_mapping(
     *,
+    season: str,
     player_df: Optional[pd.DataFrame],
     player_required: Optional[Dict[str, str]],
     mapping_csv: Optional[str],
@@ -486,12 +503,13 @@ def build_player_mapping(
             )
         return {raw: int(raw) for raw in raw_values}, warnings
 
-    fpl_to_id = get_player_fpl_id_to_id()
+    fpl_to_id = get_player_fpl_id_to_id(season)
     missing_fpl = sorted(raw for raw in raw_values if raw not in fpl_to_id)
     if missing_fpl:
         raise RuntimeError(
-            "Direct fpl_player_id/element mapping was requested, but %s raw IDs are not in players.fpl_player_id. Examples: %s"
-            % (len(missing_fpl), missing_fpl[:10])
+            "Direct fpl_player_id/element mapping was requested, but %s raw IDs are not in "
+            "players.fpl_player_id for season %s. Examples: %s"
+            % (len(missing_fpl), season, missing_fpl[:10])
         )
 
     return {raw: fpl_to_id[raw] for raw in raw_values}, warnings
@@ -708,6 +726,7 @@ def build_report(
         warnings.extend(team_warnings)
 
         player_mapping, player_warnings = build_player_mapping(
+            season=season,
             player_df=player_df,
             player_required=player_required,
             mapping_csv=player_mapping_csv,
