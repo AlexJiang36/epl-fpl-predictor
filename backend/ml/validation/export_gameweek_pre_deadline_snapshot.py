@@ -261,16 +261,110 @@ def _player_rule_row(player: SquadPlayerState) -> Dict[str, Any]:
     }
 
 
+def _current_model_team_players(
+    previous: SquadState,
+    current_model_team_state: Optional[Mapping[str, Any]],
+    *,
+    target_gw: int,
+) -> Tuple[Dict[int, SquadPlayerState], bool]:
+    if current_model_team_state is None:
+        return {
+            int(player.fpl_player_id): player
+            for player in previous.players
+        }, False
+    if not isinstance(current_model_team_state, Mapping):
+        raise GameweekPreDeadlineSnapshotError(
+            "current_model_team_state must be a mapping when provided."
+        )
+    if current_model_team_state.get("season") not in (None, previous.season):
+        raise GameweekPreDeadlineSnapshotError(
+            "current_model_team_state season mismatch."
+        )
+    if current_model_team_state.get("state_kind") not in (None, "model_team"):
+        raise GameweekPreDeadlineSnapshotError(
+            "current_model_team_state state_kind must be model_team."
+        )
+    if current_model_team_state.get("gameweek") is not None and int(
+        current_model_team_state["gameweek"]
+    ) != int(target_gw):
+        raise GameweekPreDeadlineSnapshotError(
+            "current_model_team_state gameweek must match target_gw."
+        )
+    if current_model_team_state.get("bank_units") is not None and int(
+        current_model_team_state["bank_units"]
+    ) != int(previous.bank_units):
+        raise GameweekPreDeadlineSnapshotError(
+            "current_model_team_state bank must match previous frozen bank before transfers."
+        )
+    raw_players = (
+        current_model_team_state.get("players")
+        or current_model_team_state.get("squad")
+        or current_model_team_state.get("owned_players")
+    )
+    if not isinstance(raw_players, Sequence):
+        raise GameweekPreDeadlineSnapshotError(
+            "current_model_team_state must contain players/squad/owned_players."
+        )
+    previous_by_id = {
+        int(player.fpl_player_id): player for player in previous.players
+    }
+    players: Dict[int, SquadPlayerState] = {}
+    for index, raw in enumerate(raw_players):
+        if not isinstance(raw, Mapping):
+            raise GameweekPreDeadlineSnapshotError(
+                "current_model_team_state player[%s] must be a mapping." % index
+            )
+        raw_id = raw.get("fpl_player_id")
+        if raw_id is None:
+            raw_id = raw.get("player_id")
+        try:
+            pid = int(raw_id)
+        except (TypeError, ValueError) as exc:
+            raise GameweekPreDeadlineSnapshotError(
+                "current_model_team_state player is missing identity."
+            ) from exc
+        if pid not in previous_by_id or pid in players:
+            raise GameweekPreDeadlineSnapshotError(
+                "current_model_team_state must preserve previous ownership exactly."
+            )
+        frozen_player = previous_by_id[pid]
+        purchase = int(raw.get("purchase_price_units", frozen_player.purchase_price_units))
+        if purchase != int(frozen_player.purchase_price_units):
+            raise GameweekPreDeadlineSnapshotError(
+                "current_model_team_state may not rewrite purchase price."
+            )
+        try:
+            players[pid] = SquadPlayerState(
+                fpl_player_id=pid,
+                player_name=raw.get("player_name") or raw.get("web_name") or frozen_player.player_name,
+                position=str(raw["position"]).upper(),
+                club_id=int(raw.get("club_id") or raw.get("team_id")),
+                purchase_price_units=purchase,
+                current_price_units=int(raw["current_price_units"]),
+                selling_price_units=int(raw["selling_price_units"]),
+            )
+        except (KeyError, TypeError, ValueError, SquadStateError) as exc:
+            raise GameweekPreDeadlineSnapshotError(
+                "current_model_team_state player_id=%s has invalid valuation/metadata." % pid
+            ) from exc
+    if set(players) != set(previous_by_id):
+        raise GameweekPreDeadlineSnapshotError(
+            "current_model_team_state must contain every previously owned player."
+        )
+    return players, True
+
+
 def _build_target_model_team_state(
     *,
     previous: SquadState,
+    current_model_team_state: Optional[Mapping[str, Any]],
     chosen_plan: Mapping[str, Any],
     season: str,
     target_gw: int,
     as_of_utc: str,
     run_id: str,
     final_freeze: bool,
-) -> SquadState:
+) -> Tuple[SquadState, bool]:
     plan = dict(chosen_plan)
     transfers = list(plan.get("transfers") or [])
     if int(plan.get("transfer_count", len(transfers))) != len(transfers):
@@ -283,9 +377,11 @@ def _build_target_model_team_state(
             "chosen_plan bank_before_units does not match previous frozen state."
         )
 
-    players: Dict[int, SquadPlayerState] = {
-        int(player.fpl_player_id): player for player in previous.players
-    }
+    players, current_valuation_overlay_used = _current_model_team_players(
+        previous,
+        current_model_team_state,
+        target_gw=target_gw,
+    )
 
     for index, transfer in enumerate(transfers):
         if not isinstance(transfer, Mapping):
@@ -414,7 +510,7 @@ def _build_target_model_team_state(
             "Target Model Team lineup is illegal: %s" % lineup_report["errors"]
         )
 
-    return target_state
+    return target_state, current_valuation_overlay_used
 
 
 def _team_alex_payload(
@@ -502,6 +598,7 @@ def export_gameweek_pre_deadline_snapshot(
     previous_model_team_state: Any,
     chosen_plan: Mapping[str, Any],
     transfer_ledger_state: Any,
+    current_model_team_state: Optional[Mapping[str, Any]] = None,
     team_alex_reference: Optional[Mapping[str, Any]] = None,
     final_freeze: bool = False,
     run_id: Optional[str] = None,
@@ -614,8 +711,9 @@ def export_gameweek_pre_deadline_snapshot(
     package_dir.mkdir(parents=True, exist_ok=False)
 
     try:
-        target_state = _build_target_model_team_state(
+        target_state, current_valuation_overlay_used = _build_target_model_team_state(
             previous=previous,
+            current_model_team_state=current_model_team_state,
             chosen_plan=plan,
             season=season,
             target_gw=target_gw,
@@ -661,6 +759,11 @@ def export_gameweek_pre_deadline_snapshot(
         _write_json_new(target_state_path, target_state.to_dict())
         _write_json_new(model_team_dir / "chosen_plan.json", plan)
         _write_json_new(model_team_dir / "transfer_ledger_state.json", ledger)
+        if current_model_team_state is not None:
+            _write_json_new(
+                model_team_dir / "current_owned_state.json",
+                dict(current_model_team_state),
+            )
 
         # Track D: Team Alex, always structurally separate.
         alex_dir = package_dir / "tracks" / "team_alex"
@@ -728,6 +831,7 @@ def export_gameweek_pre_deadline_snapshot(
                 "previous_state_id": previous.state_id,
                 "previous_owned_state_fingerprint": previous_fingerprint,
                 "previous_gameweek": int(previous.gameweek),
+                "current_valuation_overlay_used": bool(current_valuation_overlay_used),
                 "target_state_id": target_state.state_id,
                 "target_owned_state_fingerprint": target_state.owned_state_fingerprint,
                 "state_status": target_state.state_status,

@@ -203,6 +203,81 @@ class SingleGWTransferOptimizerTests(unittest.TestCase):
             rules=self.rules,
         )
 
+    def test_current_valuation_overlay_supports_price_drift(self):
+        state = self.frozen_state(bank_units=0, ft_count=1)
+        current_players = []
+        for player in state.players:
+            row = player.to_dict()
+            if player.fpl_player_id == 8:
+                row["current_price_units"] = 52
+                row["selling_price_units"] = 51
+            current_players.append(row)
+
+        current_owned = {
+            "season": SEASON,
+            "state_kind": "model_team",
+            "gameweek": 3,
+            "bank_units": 0,
+            "players": current_players,
+        }
+        incoming = [
+            {
+                "fpl_player_id": 101,
+                "name": "UpgradeMID",
+                "position": "MID",
+                "club_id": 101,
+                "price_units": 51,
+                "predicted_points": 10.0,
+            }
+        ]
+        predictions = self.predictions(
+            state,
+            incoming=incoming,
+            owned_overrides={8: 1.0},
+        )
+        candidates = generate_transfer_candidates(
+            current_owned,
+            [
+                {
+                    "fpl_player_id": 101,
+                    "web_name": "UpgradeMID",
+                    "position": "MID",
+                    "team_id": 101,
+                    "team_short_name": "T101",
+                    "now_cost": 51,
+                    "status": "a",
+                    "selection_eligible": True,
+                }
+            ],
+            predictions,
+            pruning_policy=CandidatePruningPolicy(
+                max_pair_candidates_per_out=None
+            ),
+            rules=self.rules,
+        )
+        result = optimize_single_gw_transfers(
+            state,
+            candidates,
+            predictions,
+            self.ledger(state),
+            max_transfers=1,
+            current_owned_state=current_owned,
+            rules=self.rules,
+        )
+        self.assertTrue(result["current_valuation_overlay_used"])
+        matching = [
+            option
+            for option in result["ranked_options"]
+            if option["action"] == "TRANSFER"
+            and option["transfers"][0]["out_fpl_player_id"] == 8
+        ]
+        self.assertTrue(matching)
+        self.assertEqual(
+            matching[0]["transfers"][0]["out_selling_price_units"],
+            51,
+        )
+
+
     def test_no_transfer_is_first_class_candidate(self):
         result = self.run_case(incoming=[], max_transfers=0)
         self.assertEqual(result["winner"]["action"], "NO TRANSFER")

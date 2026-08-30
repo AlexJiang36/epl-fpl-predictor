@@ -196,7 +196,7 @@ class GameweekPreDeadlineSnapshotTests(unittest.TestCase):
     def export(self, *, final=False, plan=None, alex=None, run_id=None,
                as_of="2026-09-01T17:00:00Z",
                deadline="2026-09-01T18:00:00Z",
-               state=None):
+               state=None, current_state=None):
         state = state or self.previous_state()
         return export_gameweek_pre_deadline_snapshot(
             artifact_root=self.artifact_root,
@@ -213,6 +213,7 @@ class GameweekPreDeadlineSnapshotTests(unittest.TestCase):
             previous_model_team_state=state,
             chosen_plan=plan or self.no_transfer_plan(state),
             transfer_ledger_state=self.ledger(state),
+            current_model_team_state=current_state,
             team_alex_reference=alex,
             final_freeze=final,
             run_id=run_id,
@@ -227,6 +228,52 @@ class GameweekPreDeadlineSnapshotTests(unittest.TestCase):
         return json.loads(
             Path(result["model_team_state_path"]).read_text(encoding="utf-8")
         )
+
+    def test_current_valuation_overlay_updates_target_prices_without_changing_predecessor(self):
+        state = self.previous_state()
+        current_players = []
+        for player in state.players:
+            row = player.to_dict()
+            if player.fpl_player_id == 8:
+                row["current_price_units"] = 52
+                row["selling_price_units"] = 51
+            current_players.append(row)
+        current_state = {
+            "season": SEASON,
+            "state_kind": "model_team",
+            "gameweek": 3,
+            "bank_units": state.bank_units,
+            "players": current_players,
+        }
+        result = self.export(
+            run_id="candidate_current_prices",
+            state=state,
+            current_state=current_state,
+        )
+        target = self.model_team_state(result)
+        p8 = next(
+            row for row in target["players"]
+            if int(row["fpl_player_id"]) == 8
+        )
+        self.assertEqual(p8["current_price_units"], 52)
+        self.assertEqual(p8["selling_price_units"], 51)
+        manifest = self.manifest(result)
+        self.assertTrue(
+            manifest["model_team"]["current_valuation_overlay_used"]
+        )
+        self.assertEqual(
+            manifest["model_team"]["previous_owned_state_fingerprint"],
+            state.owned_state_fingerprint,
+        )
+        self.assertTrue(
+            (
+                Path(result["snapshot_dir"])
+                / "tracks"
+                / "model_team"
+                / "current_owned_state.json"
+            ).is_file()
+        )
+
 
     def test_candidate_snapshot_writes_four_tracks(self):
         result = self.export(run_id="candidate_a")

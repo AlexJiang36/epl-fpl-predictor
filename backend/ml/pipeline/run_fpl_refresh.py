@@ -6,10 +6,11 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass, is_dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
@@ -19,8 +20,34 @@ from urllib.request import Request, urlopen
 
 import pandas as pd
 
+from app.rules.chips import derive_chip_inventory, load_chip_rules
+from ml.contracts.squad_state import (
+    ChipInventoryEntry,
+    ChipInventoryState,
+    FreeTransferState,
+    SquadPlayerState,
+    SquadSelectionState,
+    SquadState,
+    calculate_selling_price_units,
+    load_squad_state_json,
+)
+from ml.decision.free_transfer_ledger import build_ledger_state
+from ml.decision.generate_transfer_candidates import (
+    CandidatePruningPolicy,
+    generate_transfer_candidates,
+)
+from ml.decision.optimize_single_gw_transfers import optimize_single_gw_transfers
+from ml.validation.export_gameweek_pre_deadline_snapshot import (
+    SNAPSHOT_KIND_CANDIDATE,
+    export_gameweek_pre_deadline_snapshot,
+)
+from ml.validation.resolve_prediction_mode import resolve_prediction_mode
 
-RUNNER_VERSION = "fpl_weekly_runner_v0_1"
+
+RUNNER_VERSION = "fpl_weekly_runner_v0_2"
+PRE_INTEGRATION_VERSION = "fpl_pre_pipeline_integration_v1"
+ELIGIBILITY_ADAPTER_VERSION = "fpl_live_selection_eligibility_v1"
+LEGACY_GW2_STATE_ADAPTER_VERSION = "legacy_gw2_model_team_to_squad_state_v1"
 DAG_VERSION = "fpl_gameweek_dag_v1"
 POSITIONS = ("GKP", "DEF", "MID", "FWD")
 VALID_PHASES = ("pre", "freeze", "post", "auto", "status")
@@ -118,7 +145,7 @@ def pre_stage_adapters(
             depends_on=("prediction_mode",),
             planned_inputs=("resolved_prediction_mode", "live_players", "prior_evidence"),
             planned_outputs=("target_gw_player_model_artifact",),
-            implementation="existing prediction producer; Day128B adapter wiring pending",
+            implementation="existing prediction producer wired by Day128B",
         ),
         stage_adapter(
             "match_model",
@@ -126,7 +153,7 @@ def pre_stage_adapters(
             depends_on=("prediction_mode",),
             planned_inputs=("resolved_prediction_mode", "live_fixtures", "prior_evidence"),
             planned_outputs=("target_gw_match_model_artifact", "scoreline_artifact"),
-            implementation="existing prediction producer; Day128B adapter wiring pending",
+            implementation="existing prediction producer wired by Day128B",
         ),
         stage_adapter(
             "prediction_horizon",
@@ -134,7 +161,7 @@ def pre_stage_adapters(
             depends_on=("player_model", "match_model"),
             planned_inputs=("target_gw_player_model_artifact", "target_gw_match_model_artifact"),
             planned_outputs=("player_prediction_horizon", "fixture_prediction_horizon"),
-            implementation="existing horizon producer; Day128B adapter wiring pending",
+            implementation="Day128B target-GW horizon adapter",
         ),
         stage_adapter(
             "owned_squad_state",
@@ -555,6 +582,15 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--api-port", type=int, default=8765)
     p.add_argument("--top-n", type=int, default=30)
+    p.add_argument(
+        "--max-transfers",
+        type=int,
+        default=2,
+        help=(
+            "Transparent Day127A plan-search cap for one PRE run. "
+            "This is not an FPL legality rule; hit pricing remains policy-driven."
+        ),
+    )
     p.add_argument("--position-top-n", type=int, default=10)
     return p.parse_args()
 
@@ -1173,6 +1209,862 @@ def build_top10_by_position(
     return csv_path, json_path, md_path, grouped
 
 
+
+def _jsonable(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {str(key): _jsonable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [_jsonable(item) for item in value]
+    if is_dataclass(value):
+        return _jsonable(asdict(value))
+    method = getattr(value, "to_dict", None)
+    if callable(method):
+        return _jsonable(method())
+    return value
+
+
+def write_json_new(path: Path, payload: Any) -> Path:
+    target = Path(path)
+    if target.exists():
+        raise RuntimeError("Refusing to overwrite existing artifact: %s" % target)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    target.write_text(
+        json.dumps(
+            _jsonable(payload),
+            indent=2,
+            ensure_ascii=False,
+            sort_keys=True,
+            default=str,
+        ),
+        encoding="utf-8",
+    )
+    return target
+
+
+def _formal_stage(
+    recorder: StageRecorder,
+    name: str,
+    *,
+    dependencies: Sequence[str],
+    planned_inputs: Sequence[str],
+    planned_outputs: Sequence[str],
+    function: Callable[[], Any],
+    output_paths: Optional[Callable[[Any], Sequence[str]]] = None,
+) -> Any:
+    started = time.time()
+    try:
+        result = function()
+    except Exception as exc:
+        recorder.add(
+            name,
+            "FAILED",
+            started,
+            dependencies=dependencies,
+            planned_inputs=planned_inputs,
+            planned_outputs=planned_outputs,
+            note=str(exc),
+        )
+        raise
+
+    outputs: Sequence[str] = ()
+    if output_paths is not None:
+        outputs = output_paths(result)
+    recorder.add(
+        name,
+        "PASS",
+        started,
+        outputs=outputs,
+        dependencies=dependencies,
+        planned_inputs=planned_inputs,
+        planned_outputs=planned_outputs,
+    )
+    return result
+
+
+def resolve_runner_prediction_mode(
+    *,
+    season: str,
+    target_gw: int,
+    prior_season: Optional[str],
+    stabilization_gw: int,
+) -> Dict[str, Any]:
+    """Resolve the existing prediction mode and fail closed on unwired producers."""
+
+    result = resolve_prediction_mode(
+        season=season,
+        target_gw=target_gw,
+        requested_prediction_mode="auto",
+        prior_season=prior_season,
+        stabilization_gw=stabilization_gw,
+        allow_experimental_mode=False,
+    )
+    if not bool(result.get("valid")):
+        raise RuntimeError(
+            "Prediction-mode resolution failed: %s" % list(result.get("errors") or [])
+        )
+
+    mode = str(result.get("resolved_prediction_mode") or "")
+    if mode == "early_season_blend":
+        return dict(result)
+    if mode == "normal_weekly":
+        raise RuntimeError(
+            "prediction_mode=normal_weekly resolved for target_gw=%s, but the "
+            "approved GW6+ normal-weekly producer is still outstanding. Refusing "
+            "to fall back to legacy baseline_rollavg_*." % target_gw
+        )
+    raise RuntimeError(
+        "Day128B rolling PRE is a GW2+ stateful path; resolved prediction_mode=%s "
+        "is not wired here." % mode
+    )
+
+
+def validate_prediction_run(
+    prediction_run: Path,
+    *,
+    season: str,
+    target_gw: int,
+    resolved_mode: str,
+) -> Dict[str, Any]:
+    run_dir = Path(prediction_run).resolve()
+    manifest_path = run_dir / "run_manifest.json"
+    manifest = read_json(manifest_path)
+
+    if str(manifest.get("status")) != "PASS_PREVIEW":
+        raise RuntimeError(
+            "Prediction run is not PASS_PREVIEW: %s" % manifest.get("status")
+        )
+    if str(manifest.get("season")) != str(season):
+        raise RuntimeError("Prediction run season does not match PRE request.")
+    if int(manifest.get("target_gw") or -1) != int(target_gw):
+        raise RuntimeError("Prediction run target_gw does not match PRE request.")
+    if str(manifest.get("prediction_mode")) != str(resolved_mode):
+        raise RuntimeError(
+            "Prediction run mode=%s does not match resolved mode=%s."
+            % (manifest.get("prediction_mode"), resolved_mode)
+        )
+    if manifest.get("preview_only") is not True:
+        raise RuntimeError("Prediction run must remain preview_only before freeze.")
+    if manifest.get("database_prediction_write") not in (None, False):
+        raise RuntimeError(
+            "Prediction preview may not claim database_prediction_write=true."
+        )
+
+    outputs = manifest.get("outputs")
+    if not isinstance(outputs, Mapping):
+        raise RuntimeError("Prediction run manifest is missing outputs mapping.")
+
+    required = {
+        "player_predictions_preview": "player_predictions_preview.csv",
+        "match_predictions_preview": "match_predictions_preview.csv",
+        "scoreline_preview": "scoreline_preview.csv",
+        "bootstrap_snapshot": "bootstrap_snapshot.json",
+    }
+    paths: Dict[str, Path] = {}
+    for key, fallback in required.items():
+        raw = outputs.get(key) or fallback
+        path = run_dir / str(raw)
+        if not path.is_file():
+            raise RuntimeError(
+                "Prediction run is missing required %s artifact: %s" % (key, path)
+            )
+        paths[key] = path
+
+    created_at = str(manifest.get("created_at") or "").strip()
+    if not created_at:
+        raise RuntimeError("Prediction run manifest is missing created_at.")
+
+    return {
+        "run_dir": run_dir,
+        "manifest": manifest,
+        "manifest_path": manifest_path,
+        "created_at": created_at,
+        "player_csv": paths["player_predictions_preview"],
+        "match_csv": paths["match_predictions_preview"],
+        "scoreline_csv": paths["scoreline_preview"],
+        "bootstrap_json": paths["bootstrap_snapshot"],
+    }
+
+
+def target_gw_deadline_from_bootstrap(path: Path, target_gw: int) -> str:
+    payload = read_json(Path(path))
+    events = payload.get("events")
+    if not isinstance(events, list):
+        raise RuntimeError("Bootstrap snapshot is missing events.")
+    for raw in events:
+        if not isinstance(raw, Mapping):
+            continue
+        try:
+            event_id = int(raw.get("id"))
+        except (TypeError, ValueError):
+            continue
+        if event_id != int(target_gw):
+            continue
+        deadline = str(raw.get("deadline_time") or "").strip()
+        if not deadline:
+            raise RuntimeError(
+                "Bootstrap target Gameweek is missing deadline_time."
+            )
+        return deadline
+    raise RuntimeError(
+        "Bootstrap snapshot does not contain target Gameweek=%s." % target_gw
+    )
+
+
+def _nullable_float(value: Any) -> Optional[float]:
+    if value is None:
+        return None
+    try:
+        if pd.isna(value):
+            return None
+    except Exception:
+        pass
+    text = str(value).strip()
+    if not text:
+        return None
+    return float(text)
+
+
+def _nullable_int(value: Any) -> Optional[int]:
+    number = _nullable_float(value)
+    if number is None:
+        return None
+    return int(number)
+
+
+def selection_eligibility_from_live_prediction(
+    row: Mapping[str, Any],
+) -> Tuple[bool, str, List[str]]:
+    """Translate official live status into the explicit Day126B eligibility field.
+
+    This is intentionally a hard-status adapter, not a football-opinion model.
+    Doubtful players remain selectable with a visible risk flag. Missing/unknown
+    status fails closed for transfer-IN eligibility.
+    """
+
+    status = str(row.get("status") or "").strip().lower()
+    fixture_count = _nullable_int(row.get("fixture_count")) or 0
+    chance = _nullable_float(row.get("chance_of_playing_next_round"))
+
+    risk_flags: List[str] = []
+    if bool(row.get("official_availability_adjustment_applied")):
+        risk_flags.append("official_availability_adjustment")
+    if status in ("d", "i"):
+        risk_flags.append("uncertain_status")
+
+    if fixture_count <= 0:
+        return False, "no_target_gw_fixture", sorted(set(risk_flags))
+    if status in ("s", "u", "n"):
+        return (
+            False,
+            "hard_unavailable_status_%s" % status,
+            sorted(set(risk_flags + ["hard_unavailable_status"])),
+        )
+    if status == "i" and (chance is None or chance <= 0.0):
+        return (
+            False,
+            "injured_zero_or_unknown_availability",
+            sorted(set(risk_flags + ["hard_unavailable_status"])),
+        )
+    if chance is not None and chance <= 0.0:
+        return (
+            False,
+            "official_zero_availability",
+            sorted(set(risk_flags + ["official_zero_availability"])),
+        )
+    if status not in ("a", "d", "i"):
+        return (
+            False,
+            "unrecognized_live_status",
+            sorted(set(risk_flags + ["status_review_required"])),
+        )
+    if status == "d":
+        return True, "eligible_doubtful_with_visible_risk", sorted(set(risk_flags))
+    if status == "i":
+        return True, "eligible_injury_with_positive_official_chance", sorted(set(risk_flags))
+    return True, "eligible_live_status", sorted(set(risk_flags))
+
+
+def build_target_gw_horizon_artifacts(
+    *,
+    player_csv: Path,
+    match_csv: Path,
+    scoreline_csv: Path,
+    target_gw: int,
+    out_dir: Path,
+) -> Dict[str, Any]:
+    """Normalize the current prediction producer into a one-GW live horizon.
+
+    The Master Plan requires the next GW and makes later GWs optional when
+    reliable. Day128B therefore uses a target-GW-only effective horizon rather
+    than inventing missing future predictions.
+    """
+
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    player_df = pd.read_csv(player_csv)
+    required_player = {
+        "fpl_player_id",
+        "position",
+        "team_id",
+        "now_cost",
+        "status",
+        "fixture_count",
+        "predicted_points",
+    }
+    missing_player = sorted(required_player - set(player_df.columns))
+    if missing_player:
+        raise RuntimeError(
+            "Player Model artifact cannot form PRE horizon; missing %s."
+            % missing_player
+        )
+    if player_df["fpl_player_id"].duplicated().any():
+        raise RuntimeError("Player Model contains duplicate fpl_player_id rows.")
+    if player_df["predicted_points"].isna().any():
+        raise RuntimeError("Player Model contains missing predicted_points.")
+
+    market_rows: List[Dict[str, Any]] = []
+    horizon_rows: List[Dict[str, Any]] = []
+    for raw in player_df.to_dict(orient="records"):
+        eligible, reason, risk_flags = selection_eligibility_from_live_prediction(raw)
+        fpl_id = int(raw["fpl_player_id"])
+        predicted = float(raw["predicted_points"])
+        market_rows.append(
+            {
+                "fpl_player_id": fpl_id,
+                "player_name": raw.get("web_name") or raw.get("player_name"),
+                "web_name": raw.get("web_name") or raw.get("player_name"),
+                "position": str(raw["position"]).upper(),
+                "club_id": int(raw["team_id"]),
+                "team_id": int(raw["team_id"]),
+                "team_name": raw.get("team_name"),
+                "team_short_name": raw.get("team_short_name"),
+                "now_cost": int(raw["now_cost"]),
+                "status": raw.get("status"),
+                "selection_eligible": bool(eligible),
+                "eligibility_reason": reason,
+            }
+        )
+        horizon_rows.append(
+            {
+                "fpl_player_id": fpl_id,
+                "player_name": raw.get("web_name") or raw.get("player_name"),
+                "target_gw": int(target_gw),
+                "predicted_points": predicted,
+                "horizon_predicted_points": predicted,
+                "selection_eligible": bool(eligible),
+                "eligibility_reason": reason,
+                "risk_flags": risk_flags,
+                "expected_minutes": _nullable_float(
+                    raw.get("expected_minutes_total")
+                ),
+                "appearance_probability": _nullable_float(
+                    raw.get("blended_appearance_probability")
+                ),
+                "start_probability": _nullable_float(
+                    raw.get("blended_start_probability")
+                ),
+                "fallback_used": bool(raw.get("prior_fallback_used", False)),
+                "role_proxy": "target_gw_live_preview",
+            }
+        )
+
+    market_csv = out_dir / "current_market.csv"
+    horizon_csv = out_dir / "player_prediction_horizon.csv"
+    horizon_json = out_dir / "player_prediction_horizon.json"
+    pd.DataFrame(market_rows).to_csv(market_csv, index=False)
+    pd.DataFrame(horizon_rows).to_csv(horizon_csv, index=False)
+    write_json_new(
+        horizon_json,
+        {
+            "artifact_type": "fpl_live_player_prediction_horizon",
+            "artifact_version": PRE_INTEGRATION_VERSION,
+            "eligibility_adapter_version": ELIGIBILITY_ADAPTER_VERSION,
+            "target_gw": int(target_gw),
+            "effective_horizon_gameweeks": [int(target_gw)],
+            "multi_gw_horizon_used": False,
+            "missing_future_predictions_zero_filled": False,
+            "rows": horizon_rows,
+        },
+    )
+
+    match_df = pd.read_csv(match_csv)
+    score_df = pd.read_csv(scoreline_csv)
+    if "fpl_fixture_id" not in match_df.columns or "fpl_fixture_id" not in score_df.columns:
+        raise RuntimeError("Match/scoreline artifacts require fpl_fixture_id.")
+    if match_df["fpl_fixture_id"].duplicated().any():
+        raise RuntimeError("Match Model contains duplicate fpl_fixture_id rows.")
+    if score_df["fpl_fixture_id"].duplicated().any():
+        raise RuntimeError("Scoreline Model contains duplicate fpl_fixture_id rows.")
+
+    score_lookup = {
+        int(row["fpl_fixture_id"]): row
+        for row in score_df.to_dict(orient="records")
+    }
+    fixture_rows: List[Dict[str, Any]] = []
+    for match_row in match_df.to_dict(orient="records"):
+        fixture_id = int(match_row["fpl_fixture_id"])
+        score_row = score_lookup.get(fixture_id)
+        if score_row is None:
+            raise RuntimeError(
+                "Scoreline artifact is missing fpl_fixture_id=%s." % fixture_id
+            )
+        combined = dict(match_row)
+        for key, value in score_row.items():
+            if key not in combined or key.startswith("top_") or key.startswith("scoreline_") or key.startswith("score_grid_"):
+                combined[key] = value
+        combined["target_gw"] = int(target_gw)
+        combined["horizon_index"] = 1
+        fixture_rows.append(combined)
+
+    if set(score_lookup) != {
+        int(row["fpl_fixture_id"]) for row in match_df.to_dict(orient="records")
+    }:
+        raise RuntimeError("Match and scoreline fixture identities do not match exactly.")
+
+    fixture_csv = out_dir / "fixture_prediction_horizon.csv"
+    fixture_json = out_dir / "fixture_prediction_horizon.json"
+    pd.DataFrame(fixture_rows).to_csv(fixture_csv, index=False)
+    write_json_new(
+        fixture_json,
+        {
+            "artifact_type": "fpl_live_fixture_prediction_horizon",
+            "artifact_version": PRE_INTEGRATION_VERSION,
+            "target_gw": int(target_gw),
+            "effective_horizon_gameweeks": [int(target_gw)],
+            "multi_gw_horizon_used": False,
+            "rows": fixture_rows,
+        },
+    )
+
+    return {
+        "market_rows": market_rows,
+        "horizon_rows": horizon_rows,
+        "fixture_rows": fixture_rows,
+        "market_csv": market_csv,
+        "player_horizon_csv": horizon_csv,
+        "player_horizon_json": horizon_json,
+        "fixture_horizon_csv": fixture_csv,
+        "fixture_horizon_json": fixture_json,
+    }
+
+
+def _extract_player_id(value: Any, label: str) -> int:
+    if isinstance(value, Mapping):
+        for key in ("fpl_player_id", "player_id", "id"):
+            if value.get(key) not in (None, ""):
+                return int(value[key])
+        raise RuntimeError("%s is missing player identity." % label)
+    return int(value)
+
+
+def _legacy_gw2_chip_inventory(season: str, gameweek: int) -> ChipInventoryState:
+    if int(gameweek) != 2:
+        raise RuntimeError(
+            "Legacy no-chip compatibility is intentionally restricted to the verified GW2 Model Team freeze."
+        )
+    rules = load_chip_rules(season)
+    raw = derive_chip_inventory(
+        rules,
+        usage_history=[],
+        as_of_gameweek=int(gameweek),
+        validate_history=True,
+    )
+    entries: List[ChipInventoryEntry] = []
+    for chip_id, item in sorted(raw.items()):
+        current = dict(item["current_window"])
+        entries.append(
+            ChipInventoryEntry(
+                chip_id=str(chip_id),
+                remaining=int(current["remaining"]),
+                available_now=int(current["available_now"]),
+                window_id=str(item["current_window_id"]),
+            )
+        )
+    return ChipInventoryState(
+        as_of_gameweek=int(gameweek),
+        entries=tuple(entries),
+    )
+
+
+def canonicalize_legacy_gw2_model_team_state(
+    payload: Mapping[str, Any],
+    *,
+    expected_season: str,
+    expected_gameweek: int,
+) -> SquadState:
+    """Adapt only the verified old GW2 FINAL wrapper into the Day125B contract."""
+
+    if int(expected_gameweek) != 2:
+        raise RuntimeError(
+            "Legacy Model Team compatibility is restricted to previous GW2."
+        )
+    if str(payload.get("artifact_type")) != "fpl_model_team_frozen_state":
+        raise RuntimeError("Not a supported legacy Model Team frozen wrapper.")
+    if str(payload.get("season")) != str(expected_season):
+        raise RuntimeError("Legacy frozen wrapper season mismatch.")
+    if int(payload.get("gw") or -1) != 2:
+        raise RuntimeError("Legacy frozen wrapper is not GW2.")
+    if payload.get("final_pre_deadline_snapshot_frozen") is not True:
+        raise RuntimeError("Legacy GW2 wrapper is not FINAL frozen.")
+    if payload.get("final_deadline_freeze") is not True:
+        raise RuntimeError("Legacy GW2 wrapper lacks final_deadline_freeze=true.")
+
+    raw_squad = payload.get("squad")
+    if not isinstance(raw_squad, list) or len(raw_squad) != 15:
+        raise RuntimeError("Legacy GW2 wrapper must contain exactly 15 squad rows.")
+
+    players: List[SquadPlayerState] = []
+    for index, raw in enumerate(raw_squad):
+        if not isinstance(raw, Mapping):
+            raise RuntimeError("Legacy squad row %s is not a mapping." % index)
+        purchase = int(raw["purchase_price_units"])
+        current = int(raw["current_price_units"])
+        players.append(
+            SquadPlayerState(
+                fpl_player_id=int(raw["fpl_player_id"]),
+                player_name=raw.get("web_name") or raw.get("player_name"),
+                position=str(raw["position"]).upper(),
+                club_id=int(raw.get("team_id") or raw.get("club_id")),
+                purchase_price_units=purchase,
+                current_price_units=current,
+                selling_price_units=calculate_selling_price_units(
+                    purchase,
+                    current,
+                ),
+            )
+        )
+
+    lineup = payload.get("lineup")
+    if not isinstance(lineup, Mapping):
+        raise RuntimeError("Legacy GW2 wrapper is missing lineup.")
+
+    starting = tuple(
+        _extract_player_id(item, "legacy starting XI")
+        for item in lineup.get("starting_player_ids", [])
+    )
+    bench = tuple(
+        _extract_player_id(item, "legacy bench")
+        for item in lineup.get("bench_order", [])
+    )
+    captain = _extract_player_id(lineup.get("captain"), "legacy captain")
+    vice = _extract_player_id(lineup.get("vice_captain"), "legacy vice captain")
+
+    transfer = payload.get("transfer_decision")
+    if not isinstance(transfer, Mapping):
+        raise RuntimeError("Legacy GW2 wrapper is missing transfer_decision.")
+    ft_next = int(transfer["free_transfers_next_gameweek"])
+    bank_after = int(transfer["bank_after_units"])
+    frozen_at = str(payload.get("frozen_at_utc") or "").strip()
+    freeze_id = str(payload.get("freeze_id") or "").strip()
+    if not frozen_at or not freeze_id:
+        raise RuntimeError("Legacy GW2 wrapper is missing freeze identity/time.")
+
+    return SquadState(
+        season=str(expected_season),
+        gameweek=2,
+        as_of_utc=frozen_at,
+        state_version=LEGACY_GW2_STATE_ADAPTER_VERSION,
+        state_kind="model_team",
+        state_status="frozen",
+        source_phase_id="GW02-FREEZE",
+        source_run_id=freeze_id,
+        players=tuple(players),
+        selection=SquadSelectionState(
+            starting_xi_player_ids=starting,
+            bench_order_player_ids=bench,
+            captain_player_id=captain,
+            vice_captain_player_id=vice,
+        ),
+        bank_units=bank_after,
+        chip_inventory=_legacy_gw2_chip_inventory(
+            expected_season,
+            2,
+        ),
+        free_transfers=FreeTransferState(
+            available_for_gameweek=3,
+            count=ft_next,
+        ),
+        predecessor=None,
+        shadow_optimal=None,
+    )
+
+
+def discover_previous_model_team_state(
+    planning_root: Path,
+    *,
+    season: str,
+    target_gw: int,
+) -> Tuple[SquadState, Path, str]:
+    previous_gw = int(target_gw) - 1
+    if previous_gw < 1:
+        raise RuntimeError("Stateful PRE requires target_gw >= 2.")
+
+    roots = [
+        planning_root
+        / "frozen-snapshots"
+        / season
+        / ("gw%02d" % previous_gw),
+        planning_root
+        / "gw-pre"
+        / season
+        / ("gw%02d" % previous_gw),
+    ]
+    candidates: List[Path] = []
+    for root in roots:
+        if root.is_dir():
+            candidates.extend(root.rglob("model_team_state.json"))
+    candidates = sorted(
+        {path.resolve() for path in candidates},
+        key=lambda path: path.stat().st_mtime,
+        reverse=True,
+    )
+
+    legacy_errors: List[str] = []
+    for path in candidates:
+        try:
+            state = load_squad_state_json(path)
+        except Exception as canonical_exc:
+            try:
+                payload = read_json(path)
+                state = canonicalize_legacy_gw2_model_team_state(
+                    payload,
+                    expected_season=season,
+                    expected_gameweek=previous_gw,
+                )
+            except Exception as legacy_exc:
+                legacy_errors.append(
+                    "%s: canonical=%s; legacy=%s"
+                    % (path, canonical_exc, legacy_exc)
+                )
+                continue
+            source_kind = "legacy_gw2_compat"
+        else:
+            source_kind = "canonical"
+
+        if (
+            state.season == season
+            and int(state.gameweek) == previous_gw
+            and state.state_kind == "model_team"
+            and state.state_status == "frozen"
+        ):
+            return state, path, source_kind
+
+    raise RuntimeError(
+        "Could not discover a frozen Model Team state for season=%s previous_gw=%s. "
+        "Checked model_team_state.json candidates. Details: %s"
+        % (season, previous_gw, legacy_errors[-3:])
+    )
+
+
+def build_current_owned_state_for_candidates(
+    previous: SquadState,
+    market_rows: Sequence[Mapping[str, Any]],
+    *,
+    target_gw: int,
+) -> Dict[str, Any]:
+    """Overlay current official prices/club metadata on immutable ownership lineage."""
+
+    market_by_id = {
+        int(row["fpl_player_id"]): dict(row)
+        for row in market_rows
+    }
+    players: List[Dict[str, Any]] = []
+    changes: List[Dict[str, Any]] = []
+
+    for player in previous.players:
+        pid = int(player.fpl_player_id)
+        current = market_by_id.get(pid)
+        if current is None:
+            raise RuntimeError(
+                "Current Player Model/market is missing owned fpl_player_id=%s." % pid
+            )
+        current_position = str(current["position"]).upper()
+        current_club = int(current["club_id"])
+        current_price = int(current["now_cost"])
+        current_selling = calculate_selling_price_units(
+            int(player.purchase_price_units),
+            current_price,
+        )
+
+        changed_fields: Dict[str, Any] = {}
+        if current_position != str(player.position):
+            changed_fields["position"] = {
+                "previous": str(player.position),
+                "current": current_position,
+            }
+        if current_club != int(player.club_id):
+            changed_fields["club_id"] = {
+                "previous": int(player.club_id),
+                "current": current_club,
+            }
+        if current_price != int(player.current_price_units):
+            changed_fields["current_price_units"] = {
+                "previous": int(player.current_price_units),
+                "current": current_price,
+            }
+        if current_selling != int(player.selling_price_units):
+            changed_fields["selling_price_units"] = {
+                "previous": int(player.selling_price_units),
+                "current": current_selling,
+            }
+        if changed_fields:
+            changes.append(
+                {
+                    "fpl_player_id": pid,
+                    "changes": changed_fields,
+                }
+            )
+
+        players.append(
+            {
+                "fpl_player_id": pid,
+                "player_name": player.player_name,
+                "position": current_position,
+                "club_id": current_club,
+                "purchase_price_units": int(player.purchase_price_units),
+                "current_price_units": current_price,
+                "selling_price_units": current_selling,
+            }
+        )
+
+    return {
+        "season": previous.season,
+        "gameweek": int(target_gw),
+        "state_kind": previous.state_kind,
+        "bank_units": int(previous.bank_units),
+        "players": players,
+        "source_frozen_state_id": previous.state_id,
+        "source_owned_state_fingerprint": previous.owned_state_fingerprint,
+        "current_valuation_overlay": True,
+        "price_as_of_policy": "current_market_with_fpl_selling_price_rule_v1",
+        "metadata_or_price_changes": changes,
+        "change_count": len(changes),
+    }
+
+
+def build_match_model_source_bundle(
+    *,
+    out_dir: Path,
+    match_csv: Path,
+    scoreline_csv: Path,
+    fixture_horizon_json: Path,
+    prediction_run_id: str,
+) -> Path:
+    bundle = Path(out_dir)
+    bundle.mkdir(parents=True, exist_ok=False)
+    for source in (match_csv, scoreline_csv, fixture_horizon_json):
+        shutil.copy2(str(source), str(bundle / source.name))
+    write_json_new(
+        bundle / "source_reference.json",
+        {
+            "artifact_type": "fpl_match_model_plus_scoreline_bundle",
+            "artifact_version": PRE_INTEGRATION_VERSION,
+            "source_prediction_run_id": prediction_run_id,
+            "match_predictions": match_csv.name,
+            "scoreline_predictions": scoreline_csv.name,
+            "fixture_horizon": fixture_horizon_json.name,
+        },
+    )
+    return bundle
+
+
+def write_formal_pre_manifest(
+    *,
+    package_dir: Path,
+    season: str,
+    target_gw: int,
+    prior_season: str,
+    prediction_mode_result: Mapping[str, Any],
+    prediction_info: Mapping[str, Any],
+    previous_state: SquadState,
+    previous_state_path: Path,
+    previous_state_source_kind: str,
+    current_owned_state_path: Path,
+    horizon: Mapping[str, Any],
+    ledger_state: Any,
+    candidates_path: Path,
+    decision_path: Path,
+    snapshot_result: Mapping[str, Any],
+    recorder: StageRecorder,
+    publish_requested: bool,
+    max_transfers: int,
+    status: str = "PASS_PRE_CANDIDATE",
+    blocker: str = "",
+) -> Path:
+    inputs = {
+        "prediction_run": str(prediction_info["run_dir"]),
+        "prediction_manifest": str(prediction_info["manifest_path"]),
+        "player_model": str(prediction_info["player_csv"]),
+        "match_model": str(prediction_info["match_csv"]),
+        "scoreline_model": str(prediction_info["scoreline_csv"]),
+        "previous_frozen_model_team": str(previous_state_path),
+        "current_owned_state": str(current_owned_state_path),
+    }
+    fingerprints: Dict[str, str] = {}
+    for key, raw in inputs.items():
+        path = Path(raw)
+        if path.is_file():
+            fingerprints[key] = sha256_file(path)
+
+    payload = {
+        "artifact_type": "fpl_unified_pre_candidate_package",
+        "artifact_version": PRE_INTEGRATION_VERSION,
+        "runner_version": RUNNER_VERSION,
+        "dag_version": DAG_VERSION,
+        "created_at_utc": utc_now(),
+        "status": status,
+        "season": season,
+        "target_gw": int(target_gw),
+        "prior_season": prior_season,
+        "phase": "pre",
+        "resolved_prediction_mode": prediction_mode_result.get(
+            "resolved_prediction_mode"
+        ),
+        "publish_predictions_requested": bool(publish_requested),
+        "configured_max_transfers": int(max_transfers),
+        "inputs": inputs,
+        "input_fingerprints": fingerprints,
+        "previous_squad_state": {
+            "state_id": previous_state.state_id,
+            "owned_state_fingerprint": previous_state.owned_state_fingerprint,
+            "source_kind": previous_state_source_kind,
+            "gameweek": int(previous_state.gameweek),
+            "bank_units": int(previous_state.bank_units),
+            "free_transfers_available_for_gameweek": int(
+                previous_state.free_transfers.available_for_gameweek
+            ),
+            "free_transfers": int(previous_state.free_transfers.count),
+        },
+        "horizon": {
+            "effective_gameweeks": [int(target_gw)],
+            "multi_gw_horizon_used": False,
+            "missing_future_predictions_zero_filled": False,
+            "player_horizon_csv": str(horizon["player_horizon_csv"]),
+            "fixture_horizon_csv": str(horizon["fixture_horizon_csv"]),
+        },
+        "free_transfer_ledger": _jsonable(ledger_state),
+        "transfer_candidates": str(candidates_path),
+        "transfer_decision": str(decision_path),
+        "pre_deadline_snapshot": dict(snapshot_result),
+        "stage_results": list(recorder.rows),
+        "blocker": blocker or None,
+        "preview_only": True,
+        "final_deadline_freeze": False,
+        "final_pre_deadline_snapshot_frozen": False,
+        "safety": {
+            "opening_squad_optimizer_used": False,
+            "legacy_weekly_transfer_optimizer_used": False,
+            "legacy_weekly_lineup_preview_used": False,
+            "team_alex_consumed_by_model_team": False,
+            "target_gw_actuals_consumed": False,
+            "auto_final_freeze": False,
+        },
+    }
+    return write_json_new(package_dir / "run_manifest.json", payload)
+
+
+
 def find_previous_squad_json(
     planning_root: Path,
     season: str,
@@ -1755,7 +2647,7 @@ def print_status(
     print("latest_candidate_package:", package)
 
 
-def run_pre(
+def _run_pre_legacy_compat(
     args: argparse.Namespace,
     repo_root: Path,
     planning_root: Path,
@@ -1935,6 +2827,468 @@ def run_pre(
                 api_proc.wait(timeout=5)
             except Exception:
                 api_proc.kill()
+
+
+
+def run_pre(
+    args: argparse.Namespace,
+    repo_root: Path,
+    planning_root: Path,
+    python_exe: str,
+    env: Mapping[str, str],
+    recorder: StageRecorder,
+) -> Path:
+    """Run the Day128B formal PRE path through an immutable candidate snapshot."""
+
+    if int(args.target_gw) < 2:
+        raise RuntimeError(
+            "Day128B is the rolling GW2+ PRE path; GW1 remains the opening-squad lifecycle."
+        )
+    if int(args.max_transfers) < 0:
+        raise RuntimeError("--max-transfers must be >= 0.")
+
+    prior_season = args.prior_season
+    if not prior_season:
+        year = int(args.season.split("_")[0])
+        prior_season = "%s_%02d" % (year - 1, year % 100)
+
+    api_proc: Optional[subprocess.Popen] = None
+    try:
+        # Stage 1/2: reuse the existing ingest adapter exactly; do not duplicate API logic.
+        if args.skip_live_refresh:
+            started = time.time()
+            recorder.add(
+                "live_ingest",
+                "REUSED",
+                started,
+                dependencies=(),
+                planned_inputs=("canonical current DB state",),
+                planned_outputs=("live_players", "live_teams", "live_fixtures", "completed_actuals"),
+                note="--skip-live-refresh explicitly requested.",
+            )
+        else:
+            if args.base_url:
+                base_url = args.base_url.rstrip("/")
+                if not wait_for_api(base_url, args.season, timeout_seconds=5.0):
+                    raise RuntimeError(
+                        "Configured backend is not reachable: %s" % base_url
+                    )
+            else:
+                api_proc, base_url = start_private_api(
+                    repo_root / "backend",
+                    python_exe,
+                    env,
+                    args.api_port,
+                    args.season,
+                )
+            started = time.time()
+            try:
+                refresh_live_data(base_url, recorder, False)
+            except Exception as exc:
+                recorder.add(
+                    "live_ingest",
+                    "FAILED",
+                    started,
+                    dependencies=(),
+                    planned_inputs=("FPL API", "season", "target_gw"),
+                    planned_outputs=("live_players", "live_teams", "live_fixtures", "completed_actuals"),
+                    note=str(exc),
+                )
+                raise
+            recorder.add(
+                "live_ingest",
+                "PASS",
+                started,
+                dependencies=(),
+                planned_inputs=("FPL API", "season", "target_gw"),
+                planned_outputs=("live_players", "live_teams", "live_fixtures", "completed_actuals"),
+            )
+
+        # Stage 3: resolve prediction mode through the existing resolver.
+        mode_result = _formal_stage(
+            recorder,
+            "prediction_mode",
+            dependencies=("live_ingest",),
+            planned_inputs=("season", "target_gw", "prior_season"),
+            planned_outputs=("resolved_prediction_mode",),
+            function=lambda: resolve_runner_prediction_mode(
+                season=args.season,
+                target_gw=args.target_gw,
+                prior_season=prior_season,
+                stabilization_gw=args.stabilization_gw,
+            ),
+        )
+        resolved_mode = str(mode_result["resolved_prediction_mode"])
+
+        # Stages 4/5: current safe producer emits Player + Match + scoreline together.
+        prediction_run = run_prediction_stage(
+            repo_root=repo_root,
+            planning_root=planning_root,
+            season=args.season,
+            prior_season=prior_season,
+            gw=args.target_gw,
+            stabilization_gw=args.stabilization_gw,
+            python_exe=python_exe,
+            env=env,
+            recorder=recorder,
+            resume=args.resume,
+            dry_run=False,
+        )
+        prediction_info = validate_prediction_run(
+            prediction_run,
+            season=args.season,
+            target_gw=args.target_gw,
+            resolved_mode=resolved_mode,
+        )
+
+        started = time.time()
+        recorder.add(
+            "player_model",
+            "PASS",
+            started,
+            outputs=[str(prediction_info["player_csv"])],
+            dependencies=("prediction_mode",),
+            planned_inputs=("resolved_prediction_mode", "live_players", "prior_evidence"),
+            planned_outputs=("target_gw_player_model_artifact",),
+            note="Produced by existing early-season prediction pipeline.",
+        )
+        started = time.time()
+        recorder.add(
+            "match_model",
+            "PASS",
+            started,
+            outputs=[
+                str(prediction_info["match_csv"]),
+                str(prediction_info["scoreline_csv"]),
+            ],
+            dependencies=("prediction_mode",),
+            planned_inputs=("resolved_prediction_mode", "live_fixtures", "prior_evidence"),
+            planned_outputs=("target_gw_match_model_artifact", "scoreline_artifact"),
+            note="Produced by existing early-season prediction pipeline.",
+        )
+
+        if args.publish_predictions:
+            publish_receipt = publish_predictions_if_requested(
+                repo_root=repo_root,
+                planning_root=planning_root,
+                season=args.season,
+                gw=args.target_gw,
+                prediction_run=prediction_run,
+                python_exe=python_exe,
+                env=env,
+                recorder=recorder,
+                resume=args.resume,
+                dry_run=False,
+            )
+            if publish_receipt is None:
+                raise RuntimeError(
+                    "Prediction publish completed without a receipt path."
+                )
+            verify_published_predictions(
+                repo_root=repo_root,
+                season=args.season,
+                gw=args.target_gw,
+                prediction_run=prediction_run,
+                receipt=publish_receipt,
+                python_exe=python_exe,
+                env=env,
+                recorder=recorder,
+                dry_run=False,
+            )
+
+        package_dir = candidate_package_dir(
+            planning_root,
+            args.season,
+            args.target_gw,
+        )
+        package_dir.mkdir(parents=True, exist_ok=False)
+
+        write_json_new(package_dir / "prediction_mode.json", mode_result)
+
+        # Stage 5: target-GW horizon is mandatory; later GWs remain optional.
+        horizon = _formal_stage(
+            recorder,
+            "prediction_horizon",
+            dependencies=("player_model", "match_model"),
+            planned_inputs=(
+                str(prediction_info["player_csv"]),
+                str(prediction_info["match_csv"]),
+                str(prediction_info["scoreline_csv"]),
+            ),
+            planned_outputs=(
+                "current_market.csv",
+                "player_prediction_horizon.csv",
+                "fixture_prediction_horizon.csv",
+            ),
+            function=lambda: build_target_gw_horizon_artifacts(
+                player_csv=prediction_info["player_csv"],
+                match_csv=prediction_info["match_csv"],
+                scoreline_csv=prediction_info["scoreline_csv"],
+                target_gw=args.target_gw,
+                out_dir=package_dir,
+            ),
+            output_paths=lambda result: [
+                str(result["market_csv"]),
+                str(result["player_horizon_csv"]),
+                str(result["fixture_horizon_csv"]),
+            ],
+        )
+
+        # Stage 6a: ownership always starts from a previous FINAL frozen state.
+        previous_state, previous_state_path, previous_source_kind = _formal_stage(
+            recorder,
+            "owned_squad_state",
+            dependencies=("live_ingest",),
+            planned_inputs=("previous_frozen_model_team_state", "current_market.csv"),
+            planned_outputs=("current_owned_squad_state",),
+            function=lambda: discover_previous_model_team_state(
+                planning_root,
+                season=args.season,
+                target_gw=args.target_gw,
+            ),
+            output_paths=lambda result: [str(result[1])],
+        )
+        current_owned = build_current_owned_state_for_candidates(
+            previous_state,
+            horizon["market_rows"],
+            target_gw=args.target_gw,
+        )
+        current_owned_path = write_json_new(
+            package_dir / "current_owned_squad_state.json",
+            current_owned,
+        )
+
+        # Stage 6b: policy-driven FT ledger.
+        ledger_state = _formal_stage(
+            recorder,
+            "free_transfer_ledger",
+            dependencies=("owned_squad_state",),
+            planned_inputs=("previous_frozen_model_team_state", "target_season_transfer_policy"),
+            planned_outputs=("free_transfer_ledger_state",),
+            function=lambda: build_ledger_state(
+                season=args.season,
+                state_kind="model_team",
+                gameweek=args.target_gw,
+                available_free_transfers=int(previous_state.free_transfers.count),
+            ),
+        )
+        ledger_path = write_json_new(
+            package_dir / "free_transfer_ledger_state.json",
+            ledger_state,
+        )
+
+        # Stage 6c: Day126B candidates from owned state/current prices/horizon.
+        candidate_report = _formal_stage(
+            recorder,
+            "transfer_candidates",
+            dependencies=(
+                "player_model",
+                "prediction_horizon",
+                "owned_squad_state",
+                "free_transfer_ledger",
+            ),
+            planned_inputs=(
+                "current_owned_squad_state",
+                "current_market",
+                "player_prediction_horizon",
+            ),
+            planned_outputs=("legal_transfer_candidate_set",),
+            function=lambda: generate_transfer_candidates(
+                current_owned,
+                horizon["market_rows"],
+                horizon["horizon_rows"],
+                pruning_policy=CandidatePruningPolicy(
+                    max_pair_candidates_per_out=int(args.top_n),
+                ),
+            ),
+        )
+        candidates_path = write_json_new(
+            package_dir / "transfer_candidates.json",
+            candidate_report,
+        )
+
+        # Stage 6d + 7: Day127A chooses transfers and already re-optimizes XI/C/VC.
+        decision = _formal_stage(
+            recorder,
+            "transfer_decision",
+            dependencies=("transfer_candidates", "free_transfer_ledger"),
+            planned_inputs=(
+                "previous_frozen_model_team_state",
+                "legal_transfer_candidate_set",
+                "target_gw_player_predictions",
+                "free_transfer_ledger_state",
+            ),
+            planned_outputs=("chosen_transfer_or_no_transfer_plan",),
+            function=lambda: optimize_single_gw_transfers(
+                previous_state,
+                candidate_report,
+                horizon["horizon_rows"],
+                ledger_state,
+                max_transfers=int(args.max_transfers),
+                current_owned_state=current_owned,
+            ),
+        )
+        decision_path = write_json_new(
+            package_dir / "transfer_decision.json",
+            decision,
+        )
+
+        winner = decision.get("winner")
+        if not isinstance(winner, Mapping) or not isinstance(
+            winner.get("lineup"), Mapping
+        ):
+            raise RuntimeError(
+                "Day127A output is missing winner.lineup; cannot form PRE candidate."
+            )
+        started = time.time()
+        recorder.add(
+            "lineup_selection",
+            "PASS",
+            started,
+            outputs=[str(decision_path)],
+            dependencies=("transfer_decision", "player_model"),
+            planned_inputs=("chosen_transfer_or_no_transfer_plan",),
+            planned_outputs=("reoptimized_xi", "captain", "vice_captain", "ordered_bench"),
+            note="Reused Day127A winner.lineup; legacy weekly_lineup_preview was not called.",
+        )
+
+        # Stage 8: immutable Day127B candidate only, never FINAL.
+        match_bundle = build_match_model_source_bundle(
+            out_dir=package_dir / "match_model_source",
+            match_csv=prediction_info["match_csv"],
+            scoreline_csv=prediction_info["scoreline_csv"],
+            fixture_horizon_json=horizon["fixture_horizon_json"],
+            prediction_run_id=prediction_run.name,
+        )
+        deadline = target_gw_deadline_from_bootstrap(
+            prediction_info["bootstrap_json"],
+            args.target_gw,
+        )
+        as_of_time = str(prediction_info["created_at"])
+
+        player_spec = {
+            "run_id": prediction_run.name,
+            "artifact_kind": "target_gw_player_model",
+            "path": str(prediction_info["player_csv"]),
+            "season": args.season,
+            "target_gw": int(args.target_gw),
+            "as_of_utc": as_of_time,
+        }
+        match_spec = {
+            "run_id": prediction_run.name,
+            "artifact_kind": "target_gw_match_model_plus_scoreline",
+            "path": str(match_bundle),
+            "season": args.season,
+            "target_gw": int(args.target_gw),
+            "as_of_utc": as_of_time,
+        }
+
+        snapshot_result = _formal_stage(
+            recorder,
+            "pre_deadline_candidate",
+            dependencies=(
+                "player_model",
+                "match_model",
+                "owned_squad_state",
+                "free_transfer_ledger",
+                "transfer_decision",
+                "lineup_selection",
+            ),
+            planned_inputs=(
+                "player_model_artifact",
+                "match_model_artifact",
+                "previous_frozen_model_team_state",
+                "chosen_transfer_or_no_transfer_plan",
+                "free_transfer_ledger_state",
+            ),
+            planned_outputs=("immutable_pre_deadline_candidate_snapshot",),
+            function=lambda: export_gameweek_pre_deadline_snapshot(
+                artifact_root=package_dir / "pre-deadline-snapshot",
+                season=args.season,
+                target_gw=args.target_gw,
+                as_of_time=as_of_time,
+                fpl_deadline_time=deadline,
+                player_model_artifact=player_spec,
+                match_model_artifact=match_spec,
+                previous_model_team_state=previous_state,
+                chosen_plan=decision,
+                transfer_ledger_state=ledger_state,
+                current_model_team_state=current_owned,
+                team_alex_reference=None,
+                final_freeze=False,
+                run_id=package_dir.name + "_snapshot",
+            ),
+            output_paths=lambda result: [
+                str(result["snapshot_dir"]),
+                str(result["manifest_path"]),
+            ],
+        )
+        if str(snapshot_result.get("snapshot_kind")) != SNAPSHOT_KIND_CANDIDATE:
+            raise RuntimeError("PRE exporter did not return candidate snapshot kind.")
+        if snapshot_result.get("final_pre_deadline_snapshot_frozen") is not False:
+            raise RuntimeError("PRE must never create a FINAL freeze.")
+
+        # Stage 9: machine-readable unified stage manifest.
+        manifest_path = write_formal_pre_manifest(
+            package_dir=package_dir,
+            season=args.season,
+            target_gw=args.target_gw,
+            prior_season=prior_season,
+            prediction_mode_result=mode_result,
+            prediction_info=prediction_info,
+            previous_state=previous_state,
+            previous_state_path=previous_state_path,
+            previous_state_source_kind=previous_source_kind,
+            current_owned_state_path=current_owned_path,
+            horizon=horizon,
+            ledger_state=ledger_state,
+            candidates_path=candidates_path,
+            decision_path=decision_path,
+            snapshot_result=snapshot_result,
+            recorder=recorder,
+            publish_requested=args.publish_predictions,
+            max_transfers=args.max_transfers,
+        )
+
+        # Small human-readable pointer without duplicating decision/model logic.
+        summary_lines = [
+            "# FPL Unified PRE Candidate",
+            "",
+            "- Runner: `%s`" % RUNNER_VERSION,
+            "- Season: `%s`" % args.season,
+            "- Target GW: **%s**" % args.target_gw,
+            "- Prediction mode: `%s`" % resolved_mode,
+            "- Previous frozen state: `%s`" % previous_state.state_id,
+            "- Previous state source: `%s`" % previous_source_kind,
+            "- Decision: **%s**" % winner.get("action"),
+            "- Transfer count: **%s**" % winner.get("transfer_count"),
+            "- Net gain vs NO TRANSFER: **%s**" % winner.get("net_gain_vs_no_transfer"),
+            "- Candidate snapshot: `%s`" % snapshot_result.get("snapshot_dir"),
+            "- FINAL freeze: **False**",
+            "",
+            "This package is PRE only. It does not silently promote itself to FINAL.",
+            "",
+        ]
+        (package_dir / "summary.md").write_text(
+            "\n".join(summary_lines),
+            encoding="utf-8",
+        )
+
+        print("\n=== FPL Unified PRE Complete ===")
+        print("candidate_package:", package_dir)
+        print("manifest:", manifest_path)
+        print("decision:", decision_path)
+        print("snapshot:", snapshot_result["snapshot_dir"])
+        print("final_deadline_freeze: False")
+        return package_dir
+    finally:
+        if api_proc is not None:
+            api_proc.terminate()
+            try:
+                api_proc.wait(timeout=5)
+            except Exception:
+                api_proc.kill()
+
 
 
 def main() -> None:

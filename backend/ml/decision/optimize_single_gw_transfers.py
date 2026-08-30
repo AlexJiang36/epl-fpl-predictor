@@ -425,6 +425,98 @@ def _edge_ids(edge: Mapping[str, Any]) -> Tuple[int, int]:
     return out_id, in_id
 
 
+def _current_valuation_players(
+    previous: SquadState,
+    current_owned_state: Optional[Mapping[str, Any]],
+    *,
+    target_gw: int,
+) -> Tuple[List[Dict[str, Any]], bool]:
+    """Overlay current valuation/metadata without replacing frozen lineage."""
+    if current_owned_state is None:
+        return _previous_players(previous), False
+    if not isinstance(current_owned_state, Mapping):
+        raise SingleGWTransferOptimizerError(
+            "current_owned_state must be a mapping when provided."
+        )
+    if current_owned_state.get("season") not in (None, previous.season):
+        raise SingleGWTransferOptimizerError(
+            "current_owned_state season does not match previous frozen state."
+        )
+    if current_owned_state.get("state_kind") not in (None, previous.state_kind):
+        raise SingleGWTransferOptimizerError(
+            "current_owned_state state_kind does not match previous frozen state."
+        )
+    if current_owned_state.get("gameweek") is not None and int(
+        current_owned_state["gameweek"]
+    ) != int(target_gw):
+        raise SingleGWTransferOptimizerError(
+            "current_owned_state gameweek must match target Gameweek=%s." % target_gw
+        )
+    if current_owned_state.get("bank_units") is not None and int(
+        current_owned_state["bank_units"]
+    ) != int(previous.bank_units):
+        raise SingleGWTransferOptimizerError(
+            "current_owned_state bank must match previous frozen state before transfers."
+        )
+    raw_players = (
+        current_owned_state.get("players")
+        or current_owned_state.get("squad")
+        or current_owned_state.get("owned_players")
+    )
+    if not isinstance(raw_players, Sequence):
+        raise SingleGWTransferOptimizerError(
+            "current_owned_state must contain players/squad/owned_players."
+        )
+    previous_by_id = {
+        int(player.fpl_player_id): player for player in previous.players
+    }
+    current_by_id: Dict[int, Dict[str, Any]] = {}
+    for index, raw in enumerate(raw_players):
+        if not isinstance(raw, Mapping):
+            raise SingleGWTransferOptimizerError(
+                "current_owned_state player[%s] must be a mapping." % index
+            )
+        pid = _player_id(raw, "current_owned_state player[%s]" % index)
+        if pid in current_by_id:
+            raise SingleGWTransferOptimizerError(
+                "current_owned_state contains duplicate player_id=%s." % pid
+            )
+        if pid not in previous_by_id:
+            raise SingleGWTransferOptimizerError(
+                "current_owned_state changes ownership; unexpected player_id=%s." % pid
+            )
+        frozen_player = previous_by_id[pid]
+        purchase = int(raw.get("purchase_price_units", frozen_player.purchase_price_units))
+        if purchase != int(frozen_player.purchase_price_units):
+            raise SingleGWTransferOptimizerError(
+                "current_owned_state may not rewrite purchase price for player_id=%s." % pid
+            )
+        try:
+            current_price = int(raw["current_price_units"])
+            selling_price = int(raw["selling_price_units"])
+            club_id = int(raw.get("club_id") or raw.get("team_id"))
+            position = str(raw["position"]).upper()
+        except (KeyError, TypeError, ValueError) as exc:
+            raise SingleGWTransferOptimizerError(
+                "current_owned_state player_id=%s is missing current valuation/metadata." % pid
+            ) from exc
+        current_by_id[pid] = {
+            "fpl_player_id": pid,
+            "player_name": raw.get("player_name") or raw.get("web_name") or frozen_player.player_name,
+            "position": position,
+            "club_id": club_id,
+            "purchase_price_units": purchase,
+            "current_price_units": current_price,
+            "selling_price_units": selling_price,
+        }
+    if set(current_by_id) != set(previous_by_id):
+        missing = sorted(set(previous_by_id) - set(current_by_id))
+        raise SingleGWTransferOptimizerError(
+            "current_owned_state must preserve all previous owned players; missing=%s." % missing
+        )
+    return [current_by_id[pid] for pid in sorted(current_by_id)], True
+
+
 def _previous_players(state: SquadState) -> List[Dict[str, Any]]:
     return [
         {
@@ -700,6 +792,7 @@ def optimize_single_gw_transfers(
     free_transfer_ledger_state: FreeTransferLedgerState,
     *,
     max_transfers: int,
+    current_owned_state: Optional[Mapping[str, Any]] = None,
     rules: Optional[SquadTransferRules] = None,
 ) -> Dict[str, Any]:
     """Compare NO TRANSFER with legal Day126B transfer combinations.
@@ -760,7 +853,11 @@ def optimize_single_gw_transfers(
         target_gw_predictions,
         target_gw,
     )
-    previous_players = _previous_players(previous)
+    previous_players, current_valuation_overlay_used = _current_valuation_players(
+        previous,
+        current_owned_state,
+        target_gw=target_gw,
+    )
 
     no_transfer = _option(
         action="NO TRANSFER",
@@ -860,6 +957,7 @@ def optimize_single_gw_transfers(
         "state_kind": previous.state_kind,
         "source_frozen_state_id": previous.state_id,
         "source_owned_state_fingerprint": previous.owned_state_fingerprint,
+        "current_valuation_overlay_used": current_valuation_overlay_used,
         "candidate_generator_version": transfer_candidates.get(
             "generator_version"
         ),
