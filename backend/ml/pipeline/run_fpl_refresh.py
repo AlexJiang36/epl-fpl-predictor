@@ -9,9 +9,10 @@ import re
 import subprocess
 import sys
 import time
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Mapping, Optional, Sequence, Tuple
 from urllib.error import URLError, HTTPError
 from urllib.parse import urlparse
 from urllib.request import Request, urlopen
@@ -20,7 +21,497 @@ import pandas as pd
 
 
 RUNNER_VERSION = "fpl_weekly_runner_v0_1"
+DAG_VERSION = "fpl_gameweek_dag_v1"
 POSITIONS = ("GKP", "DEF", "MID", "FWD")
+VALID_PHASES = ("pre", "freeze", "post", "auto", "status")
+FAIL_FAST = True
+
+
+class GameweekDAGError(RuntimeError):
+    """Raised when a requested Gameweek DAG is unsafe or internally invalid."""
+
+
+@dataclass(frozen=True)
+class StageAdapter:
+    """Orchestration-only description of one pipeline stage.
+
+    The runner owns dependencies and execution order. Business/model logic stays
+    in the referenced implementation module and is wired by later integration
+    milestones rather than reimplemented here.
+    """
+
+    name: str
+    phase: str
+    depends_on: Tuple[str, ...]
+    planned_inputs: Tuple[str, ...]
+    planned_outputs: Tuple[str, ...]
+    implementation: str
+    note: str = ""
+
+    def to_dict(self) -> Dict[str, Any]:
+        return {
+            "name": self.name,
+            "phase": self.phase,
+            "depends_on": list(self.depends_on),
+            "planned_inputs": list(self.planned_inputs),
+            "planned_outputs": list(self.planned_outputs),
+            "implementation": self.implementation,
+            "note": self.note,
+        }
+
+
+def stage_adapter(
+    name: str,
+    phase: str,
+    *,
+    depends_on: Sequence[str] = (),
+    planned_inputs: Sequence[str] = (),
+    planned_outputs: Sequence[str] = (),
+    implementation: str,
+    note: str = "",
+) -> StageAdapter:
+    return StageAdapter(
+        name=name,
+        phase=phase,
+        depends_on=tuple(depends_on),
+        planned_inputs=tuple(planned_inputs),
+        planned_outputs=tuple(planned_outputs),
+        implementation=implementation,
+        note=note,
+    )
+
+
+def pre_stage_adapters(
+    *,
+    root_dependencies: Sequence[str] = (),
+    publish_predictions: bool = False,
+    skip_live_refresh: bool = False,
+) -> List[StageAdapter]:
+    """Return the canonical PRE graph without executing any stage."""
+
+    live_note = (
+        "--skip-live-refresh requested; later execution adapter may reuse live state."
+        if skip_live_refresh
+        else "Refresh live FPL inputs through the existing ingest adapter."
+    )
+    stages = [
+        stage_adapter(
+            "live_ingest",
+            "pre",
+            depends_on=root_dependencies,
+            planned_inputs=("FPL API", "season", "target_gw"),
+            planned_outputs=("live_players", "live_teams", "live_fixtures", "completed_actuals"),
+            implementation="existing runner/API ingest adapter",
+            note=live_note,
+        ),
+        stage_adapter(
+            "prediction_mode",
+            "pre",
+            depends_on=("live_ingest",),
+            planned_inputs=("season", "target_gw", "completed_actuals"),
+            planned_outputs=("resolved_prediction_mode",),
+            implementation="existing prediction-mode resolver",
+        ),
+        stage_adapter(
+            "player_model",
+            "pre",
+            depends_on=("prediction_mode",),
+            planned_inputs=("resolved_prediction_mode", "live_players", "prior_evidence"),
+            planned_outputs=("target_gw_player_model_artifact",),
+            implementation="existing prediction producer; Day128B adapter wiring pending",
+        ),
+        stage_adapter(
+            "match_model",
+            "pre",
+            depends_on=("prediction_mode",),
+            planned_inputs=("resolved_prediction_mode", "live_fixtures", "prior_evidence"),
+            planned_outputs=("target_gw_match_model_artifact", "scoreline_artifact"),
+            implementation="existing prediction producer; Day128B adapter wiring pending",
+        ),
+        stage_adapter(
+            "prediction_horizon",
+            "pre",
+            depends_on=("player_model", "match_model"),
+            planned_inputs=("target_gw_player_model_artifact", "target_gw_match_model_artifact"),
+            planned_outputs=("player_prediction_horizon", "fixture_prediction_horizon"),
+            implementation="existing horizon producer; Day128B adapter wiring pending",
+        ),
+        stage_adapter(
+            "owned_squad_state",
+            "pre",
+            depends_on=("live_ingest",),
+            planned_inputs=("previous_frozen_squad_state", "current_prices", "current_player_metadata"),
+            planned_outputs=("current_owned_squad_state",),
+            implementation="ml.contracts.squad_state",
+            note="GW2+ continuity only; never rebuild a normal-week squad from scratch.",
+        ),
+        stage_adapter(
+            "free_transfer_ledger",
+            "pre",
+            depends_on=("owned_squad_state",),
+            planned_inputs=("current_owned_squad_state", "target_season_transfer_policy"),
+            planned_outputs=("free_transfer_ledger_state",),
+            implementation="ml.decision.free_transfer_ledger",
+        ),
+        stage_adapter(
+            "transfer_candidates",
+            "pre",
+            depends_on=(
+                "player_model",
+                "prediction_horizon",
+                "owned_squad_state",
+                "free_transfer_ledger",
+            ),
+            planned_inputs=(
+                "current_owned_squad_state",
+                "player_prediction_horizon",
+                "free_transfer_ledger_state",
+            ),
+            planned_outputs=("legal_transfer_candidate_set",),
+            implementation="ml.decision.generate_transfer_candidates",
+        ),
+        stage_adapter(
+            "transfer_decision",
+            "pre",
+            depends_on=("transfer_candidates", "free_transfer_ledger"),
+            planned_inputs=(
+                "previous_frozen_squad_state",
+                "legal_transfer_candidate_set",
+                "target_gw_player_predictions",
+                "free_transfer_ledger_state",
+            ),
+            planned_outputs=("chosen_transfer_or_no_transfer_plan",),
+            implementation="ml.decision.optimize_single_gw_transfers",
+            note="NO TRANSFER is first-class; opening-squad optimizer is prohibited.",
+        ),
+        stage_adapter(
+            "lineup_selection",
+            "pre",
+            depends_on=("transfer_decision", "player_model"),
+            planned_inputs=("chosen_transfer_or_no_transfer_plan",),
+            planned_outputs=("reoptimized_xi", "captain", "vice_captain", "ordered_bench"),
+            implementation="ml.decision.optimize_single_gw_transfers",
+            note=(
+                "Reuses the XI/C/VC already re-optimized inside Day127A; "
+                "this stage is orchestration/selection only, not a third lineup optimizer."
+            ),
+        ),
+    ]
+
+    if publish_predictions:
+        stages.append(
+            stage_adapter(
+                "prediction_publish",
+                "pre",
+                depends_on=("player_model", "match_model"),
+                planned_inputs=("target_gw_player_model_artifact", "target_gw_match_model_artifact"),
+                planned_outputs=("prediction_publish_receipt",),
+                implementation="existing prediction publisher/verifier",
+                note="Optional explicit write path; never implied by PRE.",
+            )
+        )
+
+    candidate_deps = [
+        "player_model",
+        "match_model",
+        "owned_squad_state",
+        "free_transfer_ledger",
+        "transfer_decision",
+        "lineup_selection",
+    ]
+    if publish_predictions:
+        candidate_deps.append("prediction_publish")
+
+    stages.append(
+        stage_adapter(
+            "pre_deadline_candidate",
+            "pre",
+            depends_on=candidate_deps,
+            planned_inputs=(
+                "target_gw_player_model_artifact",
+                "target_gw_match_model_artifact",
+                "current_owned_squad_state",
+                "chosen_transfer_or_no_transfer_plan",
+                "reoptimized_xi",
+                "captain",
+                "vice_captain",
+                "free_transfer_ledger_state",
+                "optional_team_alex_reference",
+            ),
+            planned_outputs=("immutable_pre_deadline_candidate_snapshot",),
+            implementation="ml.validation.export_gameweek_pre_deadline_snapshot",
+            note="Candidate only. PRE must never silently create FINAL.",
+        )
+    )
+    return stages
+
+
+def freeze_stage_adapters(
+    *,
+    require_pre_candidate_dependency: bool,
+) -> List[StageAdapter]:
+    first_deps: Sequence[str] = (
+        ("pre_deadline_candidate",) if require_pre_candidate_dependency else ()
+    )
+    return [
+        stage_adapter(
+            "freeze_window_validation",
+            "freeze",
+            depends_on=first_deps,
+            planned_inputs=("pre_deadline_candidate", "as_of_time", "fpl_deadline"),
+            planned_outputs=("freeze_window_authorized",),
+            implementation="ml.contracts.gameweek_cycle.validate_freeze_window",
+            note="FINAL freeze is explicit and must still be before the deadline.",
+        ),
+        stage_adapter(
+            "final_freeze_export",
+            "freeze",
+            depends_on=("freeze_window_validation",),
+            planned_inputs=(
+                "player_model_artifact",
+                "match_model_artifact",
+                "model_team_state",
+                "chosen_transfer_or_no_transfer_plan",
+                "reoptimized_xi_c_vc",
+                "free_transfer_ledger_state",
+                "optional_team_alex_reference",
+            ),
+            planned_outputs=("immutable_final_pre_deadline_snapshot",),
+            implementation="ml.validation.export_gameweek_pre_deadline_snapshot",
+            note="Reuses Day127B; never create another freezer implementation.",
+        ),
+    ]
+
+
+def post_stage_adapters(
+    *,
+    root_dependencies: Sequence[str] = (),
+    stage_prefix: str = "",
+) -> List[StageAdapter]:
+    finality_name = stage_prefix + "actuals_finality"
+    evaluation_name = stage_prefix + "post_evaluation"
+    return [
+        stage_adapter(
+            finality_name,
+            "post",
+            depends_on=root_dependencies,
+            planned_inputs=("official_target_gw_actuals", "fixture_finality"),
+            planned_outputs=("final_actuals_manifest",),
+            implementation="existing actual-ingest/finality adapter; Day129A wiring pending",
+        ),
+        stage_adapter(
+            evaluation_name,
+            "post",
+            depends_on=(finality_name,),
+            planned_inputs=("frozen_pre_deadline_snapshot", "final_actuals_manifest"),
+            planned_outputs=("immutable_post_gameweek_evaluation",),
+            implementation="ml.eval.evaluate_gameweek_post",
+            note="Evaluation must point to frozen PRE evidence; never reconstruct predictions.",
+        ),
+    ]
+
+
+def validate_phase_request(phase: str, *, final_freeze: bool) -> None:
+    normalized = str(phase).strip().lower()
+    if normalized not in VALID_PHASES:
+        raise GameweekDAGError("Unsupported phase: %s" % phase)
+    if final_freeze and normalized not in ("freeze", "auto"):
+        raise GameweekDAGError(
+            "--final-freeze is legal only with --phase freeze or --phase auto."
+        )
+    if normalized == "freeze" and not final_freeze:
+        raise GameweekDAGError(
+            "--phase freeze requires the explicit --final-freeze flag."
+        )
+
+
+def validate_stage_adapters(stages: Sequence[StageAdapter]) -> Tuple[StageAdapter, ...]:
+    """Validate unique names, dependency existence, and acyclic ordering."""
+
+    by_name: Dict[str, StageAdapter] = {}
+    insertion_order: List[str] = []
+    for stage in stages:
+        if stage.name in by_name:
+            raise GameweekDAGError("Duplicate stage name: %s" % stage.name)
+        by_name[stage.name] = stage
+        insertion_order.append(stage.name)
+
+    for stage in stages:
+        missing = [dep for dep in stage.depends_on if dep not in by_name]
+        if missing:
+            raise GameweekDAGError(
+                "Stage %s has missing dependencies: %s" % (stage.name, missing)
+            )
+
+    resolved: List[str] = []
+    unresolved = list(insertion_order)
+    while unresolved:
+        progressed = False
+        for name in list(unresolved):
+            stage = by_name[name]
+            if all(dep in resolved for dep in stage.depends_on):
+                resolved.append(name)
+                unresolved.remove(name)
+                progressed = True
+        if not progressed:
+            raise GameweekDAGError(
+                "Stage dependency cycle detected among: %s" % unresolved
+            )
+
+    return tuple(by_name[name] for name in resolved)
+
+
+def build_dag_plan(
+    *,
+    phase: str,
+    season: str,
+    target_gw: int,
+    final_freeze: bool = False,
+    resume: bool = False,
+    publish_predictions: bool = False,
+    skip_live_refresh: bool = False,
+) -> Dict[str, Any]:
+    """Build and validate the intended Gameweek DAG without running model logic."""
+
+    normalized = str(phase).strip().lower()
+    validate_phase_request(normalized, final_freeze=final_freeze)
+
+    if normalized == "pre":
+        stages = pre_stage_adapters(
+            publish_predictions=publish_predictions,
+            skip_live_refresh=skip_live_refresh,
+        )
+    elif normalized == "freeze":
+        stages = freeze_stage_adapters(require_pre_candidate_dependency=False)
+    elif normalized == "post":
+        stages = post_stage_adapters()
+    elif normalized == "auto":
+        auto_post = stage_adapter(
+            "previous_gw_post",
+            "auto",
+            planned_inputs=("previous_gw_final_actuals_if_available",),
+            planned_outputs=("previous_gw_post_evaluation_or_reuse",),
+            implementation="existing POST adapter",
+            note="Safe previous-GW catch-up before target-GW PRE.",
+        )
+        stages = [auto_post]
+        stages.extend(
+            pre_stage_adapters(
+                root_dependencies=("previous_gw_post",),
+                publish_predictions=publish_predictions,
+                skip_live_refresh=skip_live_refresh,
+            )
+        )
+        if final_freeze:
+            stages.extend(
+                freeze_stage_adapters(require_pre_candidate_dependency=True)
+            )
+    else:  # status
+        stages = [
+            stage_adapter(
+                "status_discovery",
+                "status",
+                planned_inputs=("planning_root", "season", "target_gw"),
+                planned_outputs=("discovered_pipeline_status",),
+                implementation="existing runner artifact discovery",
+                note="Read-only.",
+            )
+        ]
+
+    ordered = validate_stage_adapters(stages)
+    return {
+        "dag_version": DAG_VERSION,
+        "runner_version": RUNNER_VERSION,
+        "phase": normalized,
+        "season": str(season),
+        "target_gw": int(target_gw),
+        "resume": bool(resume),
+        "publish_predictions": bool(publish_predictions),
+        "skip_live_refresh": bool(skip_live_refresh),
+        "final_freeze_requested": bool(final_freeze),
+        "fail_fast": FAIL_FAST,
+        "model_logic_executed": False,
+        "valid": True,
+        "stages": [stage.to_dict() for stage in ordered],
+    }
+
+
+def render_dag_plan(plan: Mapping[str, Any]) -> str:
+    lines = [
+        "=== FPL Unified Gameweek DAG ===",
+        "dag_version: %s" % plan["dag_version"],
+        "runner_version: %s" % plan["runner_version"],
+        "phase: %s" % plan["phase"],
+        "season: %s" % plan["season"],
+        "target_gw: %s" % plan["target_gw"],
+        "resume: %s" % plan["resume"],
+        "fail_fast: %s" % plan["fail_fast"],
+        "final_freeze_requested: %s" % plan["final_freeze_requested"],
+        "",
+    ]
+    for index, stage in enumerate(plan["stages"], start=1):
+        lines.extend(
+            [
+                "%02d. %s [%s]" % (index, stage["name"], stage["phase"]),
+                "    depends_on: %s"
+                % (", ".join(stage["depends_on"]) if stage["depends_on"] else "-"),
+                "    implementation: %s" % stage["implementation"],
+                "    planned_inputs: %s"
+                % (", ".join(stage["planned_inputs"]) if stage["planned_inputs"] else "-"),
+                "    planned_outputs: %s"
+                % (", ".join(stage["planned_outputs"]) if stage["planned_outputs"] else "-"),
+            ]
+        )
+        if stage.get("note"):
+            lines.append("    note: %s" % stage["note"])
+    lines.extend(
+        [
+            "",
+            "DAG_VALID: %s" % bool(plan["valid"]),
+            "MODEL_LOGIC_EXECUTED: %s" % bool(plan["model_logic_executed"]),
+        ]
+    )
+    return "\n".join(lines)
+
+
+def execute_stage_adapters(
+    stages: Sequence[StageAdapter],
+    executor: Callable[[StageAdapter], Optional[Sequence[str]]],
+    recorder: "StageRecorder",
+) -> None:
+    """Generic fail-fast adapter executor used by future runner wiring.
+
+    Day128A tests this orchestration contract with dummy executors only.
+    """
+
+    ordered = validate_stage_adapters(stages)
+    for stage in ordered:
+        started = time.time()
+        try:
+            outputs = executor(stage)
+        except Exception as exc:
+            recorder.add(
+                stage.name,
+                "FAILED",
+                started,
+                dependencies=stage.depends_on,
+                planned_inputs=stage.planned_inputs,
+                planned_outputs=stage.planned_outputs,
+                note=str(exc),
+            )
+            if FAIL_FAST:
+                raise
+            continue
+
+        recorder.add(
+            stage.name,
+            "PASS",
+            started,
+            outputs=outputs,
+            dependencies=stage.depends_on,
+            planned_inputs=stage.planned_inputs,
+            planned_outputs=stage.planned_outputs,
+        )
 
 
 def parse_args() -> argparse.Namespace:
@@ -30,7 +521,7 @@ def parse_args() -> argparse.Namespace:
             "ingest/prediction/evaluation/decision stages and writes one candidate package."
         )
     )
-    p.add_argument("--phase", required=True, choices=["pre", "post", "auto", "status", "freeze"])
+    p.add_argument("--phase", required=True, choices=list(VALID_PHASES))
     p.add_argument("--season", required=True)
     p.add_argument("--target-gw", type=int, required=True)
     p.add_argument("--prior-season", default=None)
@@ -39,6 +530,14 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--repo-root", default=None)
     p.add_argument("--resume", action="store_true")
     p.add_argument("--dry-run", action="store_true")
+    p.add_argument(
+        "--final-freeze",
+        action="store_true",
+        help=(
+            "Explicit authorization for a FINAL freeze. Day128A dry-run can plan "
+            "this stage; live runner wiring remains fail-closed until integration."
+        ),
+    )
     p.add_argument(
         "--publish-predictions",
         action="store_true",
@@ -157,12 +656,26 @@ class StageRecorder:
         started: float,
         outputs: Optional[Sequence[str]] = None,
         note: str = "",
+        dependencies: Optional[Sequence[str]] = None,
+        planned_inputs: Optional[Sequence[str]] = None,
+        planned_outputs: Optional[Sequence[str]] = None,
     ) -> None:
+        ended = time.time()
+        started_at = datetime.fromtimestamp(started, timezone.utc)
+        ended_at = datetime.fromtimestamp(ended, timezone.utc)
+        duration = round(ended - started, 3)
         self.rows.append(
             {
                 "stage": name,
                 "status": status,
-                "elapsed_seconds": round(time.time() - started, 3),
+                "started_at_utc": started_at.isoformat().replace("+00:00", "Z"),
+                "ended_at_utc": ended_at.isoformat().replace("+00:00", "Z"),
+                "duration_seconds": duration,
+                # Compatibility field retained for existing candidate-package consumers.
+                "elapsed_seconds": duration,
+                "dependencies": list(dependencies or []),
+                "planned_inputs": list(planned_inputs or []),
+                "planned_outputs": list(planned_outputs or []),
                 "outputs": list(outputs or []),
                 "note": note,
             }
@@ -480,6 +993,8 @@ def publish_predictions_if_requested(
         )
 
     cmd = [python_exe, "-m", module, source_flag, str(prediction_run)]
+    if "--receipt" in flags:
+        cmd.extend(["--receipt", str(receipt)])
     for flag, value in (
         ("--season", season),
         ("--target-gw", str(gw)),
@@ -538,12 +1053,6 @@ def verify_published_predictions(
             "Supported flags were: %s" % flags
         )
     cmd = [python_exe, "-m", module, source_flag, str(prediction_run)]
-    if "--receipt" not in flags:
-        raise RuntimeError(
-            "Post-publish verifier does not expose required --receipt option. "
-            "Supported flags were: %s" % flags
-        )
-    cmd.extend(["--receipt", str(receipt)])
     for flag, value in (
         ("--season", season),
         ("--target-gw", str(gw)),
@@ -1308,9 +1817,7 @@ def run_pre(
             )
             if not args.dry_run:
                 if publish_receipt is None:
-                    raise RuntimeError(
-                        "Prediction publish completed but no publish receipt was resolved for verification."
-                    )
+                    raise RuntimeError("Prediction publish completed without a receipt path.")
                 verify_published_predictions(
                     repo_root=repo_root,
                     season=args.season,
@@ -1442,14 +1949,36 @@ def main() -> None:
     env = child_env(repo_root, args.season)
     recorder = StageRecorder()
 
+    validate_phase_request(args.phase, final_freeze=bool(args.final_freeze))
+
+    if args.dry_run:
+        plan = build_dag_plan(
+            phase=args.phase,
+            season=args.season,
+            target_gw=args.target_gw,
+            final_freeze=bool(args.final_freeze),
+            resume=bool(args.resume),
+            publish_predictions=bool(args.publish_predictions),
+            skip_live_refresh=bool(args.skip_live_refresh),
+        )
+        print(render_dag_plan(plan))
+        return
+
     if args.phase == "status":
         print_status(planning_root, args.season, args.target_gw)
         return
 
     if args.phase == "freeze":
         raise RuntimeError(
-            "Generic FINAL FREEZE is intentionally fail-closed in runner v0.1. "
-            "A normal PRE/auto run must never silently create an immutable deadline freeze."
+            "Day128A defines and validates the FINAL-freeze DAG adapter but does not "
+            "wire live freeze execution yet. The explicit Day127B exporter remains the "
+            "formal freeze producer until a later runner-integration milestone."
+        )
+
+    if args.phase == "auto" and args.final_freeze:
+        raise RuntimeError(
+            "Day128A can plan --phase auto --final-freeze with --dry-run, but live "
+            "FINAL-freeze execution is intentionally fail-closed until runner integration."
         )
 
     if args.phase == "post":
