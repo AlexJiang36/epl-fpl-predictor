@@ -37,6 +37,11 @@ from ml.decision.generate_transfer_candidates import (
     generate_transfer_candidates,
 )
 from ml.decision.optimize_single_gw_transfers import optimize_single_gw_transfers
+from ml.eval.run_gameweek_evaluation import (
+    capture_or_reuse_final_actuals,
+    discover_final_evaluation as discover_integrated_final_evaluation,
+    run_gameweek_evaluation,
+)
 from ml.validation.export_gameweek_pre_deadline_snapshot import (
     SNAPSHOT_KIND_CANDIDATE,
     export_gameweek_pre_deadline_snapshot,
@@ -44,8 +49,9 @@ from ml.validation.export_gameweek_pre_deadline_snapshot import (
 from ml.validation.resolve_prediction_mode import resolve_prediction_mode
 
 
-RUNNER_VERSION = "fpl_weekly_runner_v0_2"
+RUNNER_VERSION = "fpl_weekly_runner_v0_3"
 PRE_INTEGRATION_VERSION = "fpl_pre_pipeline_integration_v1"
+POST_INTEGRATION_VERSION = "fpl_post_pipeline_integration_v1"
 ELIGIBILITY_ADAPTER_VERSION = "fpl_live_selection_eligibility_v1"
 LEGACY_GW2_STATE_ADAPTER_VERSION = "legacy_gw2_model_team_to_squad_state_v1"
 DAG_VERSION = "fpl_gameweek_dag_v1"
@@ -322,18 +328,36 @@ def post_stage_adapters(
             finality_name,
             "post",
             depends_on=root_dependencies,
-            planned_inputs=("official_target_gw_actuals", "fixture_finality"),
-            planned_outputs=("final_actuals_manifest",),
-            implementation="existing actual-ingest/finality adapter; Day129A wiring pending",
+            planned_inputs=(
+                "official_target_gw_actuals",
+                "fixture_finality",
+                "idempotent_match_actual_ingest",
+                "idempotent_player_actual_ingest",
+            ),
+            planned_outputs=("immutable_final_actuals_manifest",),
+            implementation="ml.eval.run_gameweek_evaluation.capture_or_reuse_final_actuals",
+            note=(
+                "Runner refreshes the existing ingest routes first, then freezes separate "
+                "official FPL actual evidence only when the Gameweek is fully final."
+            ),
         ),
         stage_adapter(
             evaluation_name,
             "post",
             depends_on=(finality_name,),
-            planned_inputs=("frozen_pre_deadline_snapshot", "final_actuals_manifest"),
-            planned_outputs=("immutable_post_gameweek_evaluation",),
-            implementation="ml.eval.evaluate_gameweek_post",
-            note="Evaluation must point to frozen PRE evidence; never reconstruct predictions.",
+            planned_inputs=(
+                "immutable_final_pre_deadline_player_model",
+                "immutable_final_pre_deadline_match_model",
+                "immutable_final_pre_deadline_model_team",
+                "immutable_final_pre_deadline_team_alex",
+                "immutable_final_actuals_manifest",
+            ),
+            planned_outputs=("immutable_post_gameweek_evaluation_package",),
+            implementation="ml.eval.run_gameweek_evaluation.run_gameweek_evaluation",
+            note=(
+                "Fail closed when FINAL PRE evidence is missing, mutable, post-deadline, "
+                "or reconstructed from post-result information."
+            ),
         ),
     ]
 
@@ -2306,11 +2330,10 @@ def discover_final_actual_manifest(
     season: str,
     gw: int,
 ) -> Optional[Path]:
-    base = planning_root / "gw-post" / season / ("gw%02d" % gw) / "actuals"
-    if not base.is_dir():
-        return None
-    finals = list(base.glob("*FINAL*.json"))
-    return latest_path(finals)
+    """Compatibility wrapper around the Day129A FINAL-actual discovery."""
+    from ml.eval.run_gameweek_evaluation import discover_final_actual_manifest as _discover
+
+    return _discover(planning_root, season, gw)
 
 
 def discover_final_evaluation(
@@ -2318,14 +2341,109 @@ def discover_final_evaluation(
     season: str,
     gw: int,
 ) -> Optional[Path]:
-    base = planning_root / "gw-post" / season / ("gw%02d" % gw) / "evaluation"
-    if not base.is_dir():
-        return None
-    dirs = [
-        p for p in base.iterdir()
-        if p.is_dir() and p.name.startswith("final_") and (p / "evaluation_summary.json").is_file()
-    ]
-    return latest_path(dirs)
+    return discover_integrated_final_evaluation(planning_root, season, gw)
+
+
+def run_post_pipeline(
+    *,
+    repo_root: Path,
+    planning_root: Path,
+    season: str,
+    gw: int,
+    python_exe: str,
+    env: Mapping[str, str],
+    recorder: StageRecorder,
+    resume: bool,
+    skip_live_refresh: bool,
+    base_url: str,
+    api_port: int,
+) -> Path:
+    """Run Day129A POST: idempotent ingest -> finality/capture -> frozen evaluation."""
+
+    existing = discover_final_evaluation(planning_root, season, gw)
+    if resume and existing is not None:
+        started = time.time()
+        recorder.add(
+            "post_evaluation",
+            "REUSED",
+            started,
+            outputs=[str(existing)],
+            dependencies=("actuals_finality",),
+            planned_inputs=("existing_final_post_package",),
+            planned_outputs=("immutable_post_gameweek_evaluation_package",),
+            note="Existing FINAL Day129A POST evaluation reused.",
+        )
+        print("\n[post_evaluation] REUSED %s" % existing)
+        return existing
+
+    api_proc: Optional[subprocess.Popen] = None
+    try:
+        if not skip_live_refresh:
+            if base_url:
+                resolved_base_url = base_url.rstrip("/")
+                if not wait_for_api(resolved_base_url, season, timeout_seconds=5.0):
+                    raise RuntimeError("Configured backend is not reachable: %s" % resolved_base_url)
+            else:
+                api_proc, resolved_base_url = start_private_api(
+                    repo_root / "backend",
+                    python_exe,
+                    env,
+                    api_port,
+                    season,
+                )
+            # Existing routes are season-aware/idempotent and remain the canonical DB ingest path.
+            refresh_live_data(resolved_base_url, recorder, False)
+
+        actual_manifest = _formal_stage(
+            recorder,
+            "actuals_finality",
+            dependencies=(),
+            planned_inputs=(
+                "official_target_gw_actuals",
+                "fixture_finality",
+                "idempotent_match_actual_ingest",
+                "idempotent_player_actual_ingest",
+            ),
+            planned_outputs=("immutable_final_actuals_manifest",),
+            function=lambda: capture_or_reuse_final_actuals(
+                planning_root=planning_root,
+                season=season,
+                gw=gw,
+                reuse_existing=bool(resume),
+                reuse_only=bool(skip_live_refresh),
+            ),
+            output_paths=lambda result: [str(result)],
+        )
+
+        evaluation_dir = _formal_stage(
+            recorder,
+            "post_evaluation",
+            dependencies=("actuals_finality",),
+            planned_inputs=(
+                "immutable_final_pre_deadline_player_model",
+                "immutable_final_pre_deadline_match_model",
+                "immutable_final_pre_deadline_model_team",
+                "immutable_final_pre_deadline_team_alex",
+                str(actual_manifest),
+            ),
+            planned_outputs=("immutable_post_gameweek_evaluation_package",),
+            function=lambda: run_gameweek_evaluation(
+                planning_root=planning_root,
+                season=season,
+                gw=gw,
+                actual_manifest_path=Path(actual_manifest),
+                resume=bool(resume),
+            ),
+            output_paths=lambda result: [str(result)],
+        )
+        return Path(evaluation_dir)
+    finally:
+        if api_proc is not None:
+            api_proc.terminate()
+            try:
+                api_proc.wait(timeout=5)
+            except Exception:
+                api_proc.kill()
 
 
 def run_post_evaluation(
@@ -2339,6 +2457,15 @@ def run_post_evaluation(
     resume: bool,
     dry_run: bool,
 ) -> Optional[Path]:
+    """Compatibility catch-up used by AUTO without changing Day129B semantics.
+
+    AUTO remains non-destructive: it evaluates only when a separately captured FINAL
+    actual manifest already exists. The explicit `--phase post` path is responsible
+    for idempotent live actual ingest/capture in Day129A.
+    """
+    if dry_run:
+        raise RuntimeError("Use --dry-run DAG planning instead of executing POST adapters.")
+
     existing = discover_final_evaluation(planning_root, season, gw)
     if resume and existing is not None:
         started = time.time()
@@ -2347,56 +2474,38 @@ def run_post_evaluation(
             "REUSED",
             started,
             outputs=[str(existing)],
-            note="Existing FINAL evaluation reused.",
+            note="Existing FINAL Day129A POST evaluation reused.",
         )
         print("\n[post_evaluation] REUSED %s" % existing)
         return existing
 
     actual_manifest = discover_final_actual_manifest(planning_root, season, gw)
     if actual_manifest is None:
-        print("\n[post_evaluation] SKIPPED: no FINAL actual manifest for GW%s." % gw)
         recorder.add(
             "post_evaluation",
             "SKIPPED",
             time.time(),
-            note="No FINAL actual manifest available.",
+            note="AUTO catch-up found no separately captured FINAL actual manifest.",
         )
+        print("\n[post_evaluation] SKIPPED: no FINAL actual manifest for GW%s." % gw)
         return None
 
-    output_dir = (
-        planning_root
-        / "gw-post"
-        / season
-        / ("gw%02d" % gw)
-        / "evaluation"
-        / ("final_%s" % utc_stamp())
+    started = time.time()
+    result = run_gameweek_evaluation(
+        planning_root=planning_root,
+        season=season,
+        gw=gw,
+        actual_manifest_path=actual_manifest,
+        resume=bool(resume),
     )
-    run_command(
+    recorder.add(
         "post_evaluation",
-        [
-            python_exe,
-            "-m",
-            "ml.eval.evaluate_gameweek_post",
-            "--repo-root",
-            str(repo_root),
-            "--planning-root",
-            str(planning_root),
-            "--season",
-            season,
-            "--gw",
-            str(gw),
-            "--actual-manifest",
-            str(actual_manifest),
-            "--output-dir",
-            str(output_dir),
-            "--require-final",
-        ],
-        repo_root / "backend",
-        env,
-        recorder,
-        dry_run,
+        "PASS",
+        started,
+        outputs=[str(result)],
+        note="AUTO catch-up used existing FINAL actual evidence only.",
     )
-    return None if dry_run else output_dir
+    return result
 
 
 def extract_transfer_summary(transfer_run: Path) -> Dict[str, Any]:
@@ -3336,7 +3445,7 @@ def main() -> None:
         )
 
     if args.phase == "post":
-        result = run_post_evaluation(
+        result = run_post_pipeline(
             repo_root=repo_root,
             planning_root=planning_root,
             season=args.season,
@@ -3345,14 +3454,18 @@ def main() -> None:
             env=env,
             recorder=recorder,
             resume=args.resume,
-            dry_run=args.dry_run,
+            skip_live_refresh=bool(args.skip_live_refresh),
+            base_url=args.base_url,
+            api_port=args.api_port,
         )
-        print("\n=== FPL Weekly POST Complete ===")
+        print("\n=== FPL Unified POST Complete ===")
+        print("post_integration_version:", POST_INTEGRATION_VERSION)
         print("evaluation_dir:", result)
         return
 
     if args.phase == "auto" and args.target_gw > 1:
-        # Safe, non-destructive POST catch-up for the previous GW.
+        # Preserve Day128B AUTO catch-up semantics. Day129B owns broader automatic
+        # state detection/resume behavior; Day129A only wires explicit --phase post.
         run_post_evaluation(
             repo_root=repo_root,
             planning_root=planning_root,
@@ -3362,7 +3475,7 @@ def main() -> None:
             env=env,
             recorder=recorder,
             resume=args.resume,
-            dry_run=args.dry_run,
+            dry_run=False,
         )
 
     run_pre(

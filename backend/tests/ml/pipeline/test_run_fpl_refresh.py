@@ -31,6 +31,7 @@ from ml.pipeline.run_fpl_refresh import (
     canonicalize_legacy_gw2_model_team_state,
     resolve_runner_prediction_mode,
     run_pre,
+    run_post_pipeline,
     selection_eligibility_from_live_prediction,
 )
 from ml.contracts.squad_state import (
@@ -260,6 +261,14 @@ class UnifiedGameweekDAGSkeletonTests(unittest.TestCase):
         self.assertEqual(
             plan["stages"][1]["depends_on"],
             ["actuals_finality"],
+        )
+        self.assertEqual(
+            plan["stages"][0]["implementation"],
+            "ml.eval.run_gameweek_evaluation.capture_or_reuse_final_actuals",
+        )
+        self.assertEqual(
+            plan["stages"][1]["implementation"],
+            "ml.eval.run_gameweek_evaluation.run_gameweek_evaluation",
         )
 
     def test_missing_dependency_is_rejected(self) -> None:
@@ -900,6 +909,127 @@ class UnifiedPrePipelineIntegrationTests(unittest.TestCase):
         names = [row["name"] for row in plan["stages"]]
         self.assertIn("pre_deadline_candidate", names)
         self.assertNotIn("final_freeze_export", names)
+
+
+class UnifiedPostPipelineIntegrationTests(unittest.TestCase):
+    def test_post_runs_idempotent_ingest_then_finality_then_frozen_evaluation(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repo_root = root / "repo"
+            planning_root = root / "planning"
+            (repo_root / "backend").mkdir(parents=True)
+            planning_root.mkdir()
+            actual_manifest = root / "gw2_actuals_manifest_FINAL.json"
+            actual_manifest.write_text("{}", encoding="utf-8")
+            evaluation_dir = root / "evaluation"
+            evaluation_dir.mkdir()
+
+            events = []
+            fake_proc = Mock()
+
+            def refresh_side_effect(*args, **kwargs):
+                events.append("ingest")
+
+            def capture_side_effect(**kwargs):
+                events.append("finality")
+                return actual_manifest
+
+            def evaluation_side_effect(**kwargs):
+                events.append("evaluation")
+                self.assertEqual(kwargs["actual_manifest_path"], actual_manifest)
+                return evaluation_dir
+
+            recorder = StageRecorder()
+            with patch(
+                "ml.pipeline.run_fpl_refresh.discover_final_evaluation",
+                return_value=None,
+            ), patch(
+                "ml.pipeline.run_fpl_refresh.start_private_api",
+                return_value=(fake_proc, "http://127.0.0.1:8765"),
+            ), patch(
+                "ml.pipeline.run_fpl_refresh.refresh_live_data",
+                side_effect=refresh_side_effect,
+            ) as refresh_mock, patch(
+                "ml.pipeline.run_fpl_refresh.capture_or_reuse_final_actuals",
+                side_effect=capture_side_effect,
+            ) as capture_mock, patch(
+                "ml.pipeline.run_fpl_refresh.run_gameweek_evaluation",
+                side_effect=evaluation_side_effect,
+            ) as evaluation_mock:
+                result = run_post_pipeline(
+                    repo_root=repo_root,
+                    planning_root=planning_root,
+                    season="2026_27",
+                    gw=2,
+                    python_exe="python",
+                    env={},
+                    recorder=recorder,
+                    resume=False,
+                    skip_live_refresh=False,
+                    base_url="",
+                    api_port=8765,
+                )
+
+            self.assertEqual(result, evaluation_dir)
+            self.assertEqual(events, ["ingest", "finality", "evaluation"])
+            refresh_mock.assert_called_once()
+            self.assertFalse(capture_mock.call_args.kwargs["reuse_only"])
+            evaluation_mock.assert_called_once()
+            fake_proc.terminate.assert_called_once()
+            stage_names = [row["stage"] for row in recorder.rows]
+            self.assertIn("actuals_finality", stage_names)
+            self.assertIn("post_evaluation", stage_names)
+            self.assertLess(
+                stage_names.index("actuals_finality"),
+                stage_names.index("post_evaluation"),
+            )
+
+    def test_post_skip_live_refresh_is_reuse_only_and_never_fetches_actuals(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            repo_root = root / "repo"
+            planning_root = root / "planning"
+            (repo_root / "backend").mkdir(parents=True)
+            planning_root.mkdir()
+            actual_manifest = root / "existing_final_actuals.json"
+            actual_manifest.write_text("{}", encoding="utf-8")
+            evaluation_dir = root / "evaluation"
+            evaluation_dir.mkdir()
+
+            recorder = StageRecorder()
+            with patch(
+                "ml.pipeline.run_fpl_refresh.discover_final_evaluation",
+                return_value=None,
+            ), patch(
+                "ml.pipeline.run_fpl_refresh.start_private_api",
+                side_effect=AssertionError("POST reuse-only path started an API"),
+            ), patch(
+                "ml.pipeline.run_fpl_refresh.refresh_live_data",
+                side_effect=AssertionError("POST reuse-only path ingested live data"),
+            ), patch(
+                "ml.pipeline.run_fpl_refresh.capture_or_reuse_final_actuals",
+                return_value=actual_manifest,
+            ) as capture_mock, patch(
+                "ml.pipeline.run_fpl_refresh.run_gameweek_evaluation",
+                return_value=evaluation_dir,
+            ):
+                result = run_post_pipeline(
+                    repo_root=repo_root,
+                    planning_root=planning_root,
+                    season="2026_27",
+                    gw=2,
+                    python_exe="python",
+                    env={},
+                    recorder=recorder,
+                    resume=False,
+                    skip_live_refresh=True,
+                    base_url="",
+                    api_port=8765,
+                )
+
+            self.assertEqual(result, evaluation_dir)
+            self.assertTrue(capture_mock.call_args.kwargs["reuse_only"])
+            self.assertFalse(capture_mock.call_args.kwargs["reuse_existing"])
 
 
 if __name__ == "__main__":
