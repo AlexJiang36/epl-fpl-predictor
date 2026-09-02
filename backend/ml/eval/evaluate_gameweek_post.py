@@ -277,80 +277,204 @@ def captain_bonus(players: Sequence[Dict[str, Any]], captain_id: int, vice_id: i
     return {"effective_captain_id": None, "effective_captain": None, "bonus_points": 0, "vice_triggered": False}
 
 
-def evaluate_team(label: str, squad: List[Dict[str, Any]], starters: List[Dict[str, Any]], bench: List[Dict[str, Any]], captain_id: int, vice_id: int, autosub_mode: str) -> Dict[str, Any]:
-    """Evaluate frozen-XI decision quality separately from official-FPL autosub realization.
+def formation_name(players: Sequence[Dict[str, Any]]) -> Optional[str]:
+    if len(players) != 11 or not validate_formation(players):
+        return None
+    counts = {p: 0 for p in POSITIONS}
+    for row in players:
+        counts[row["position"]] += 1
+    return "%d-%d-%d" % (counts["DEF"], counts["MID"], counts["FWD"])
 
-    PRIMARY headline contract:
-      - score exactly the frozen starting XI;
-      - a frozen starter with 0 minutes contributes its actual 0 points;
-      - bench players never replace the frozen XI in the primary score;
-      - captain/vice fallback is evaluated only within that frozen XI.
 
-    SECONDARY reference contract:
-      - where bench order is authoritative, apply automatic substitutions and legal
-        formation constraints to approximate the official realized FPL score;
-      - if bench order is not authoritative and a starter did not play, leave the
-        secondary official-style score unavailable rather than guessing.
+def _captain_result_with_multiplier(
+    players: Sequence[Dict[str, Any]],
+    captain_id: int,
+    vice_id: int,
+    multiplier: int,
+) -> Dict[str, Any]:
+    base = captain_bonus(players, captain_id, vice_id)
+    effective_id = base.get("effective_captain_id")
+    by_id = {r["fpl_player_id"]: r for r in players}
+    effective = by_id.get(effective_id) if effective_id is not None else None
+    points = float(effective["actual_points"]) if effective is not None else 0.0
+    bonus_points = points * max(0, int(multiplier) - 1)
+    return {
+        **base,
+        "captain_multiplier": int(multiplier),
+        "bonus_points": bonus_points,
+        "captain_base_actual_points": points,
+    }
+
+
+def evaluate_team(
+    label: str,
+    squad: List[Dict[str, Any]],
+    starters: List[Dict[str, Any]],
+    bench: List[Dict[str, Any]],
+    captain_id: int,
+    vice_id: int,
+    autosub_mode: str,
+    chip: Optional[str] = None,
+) -> Dict[str, Any]:
+    """Evaluate frozen decision quality and final FPL-rules realization separately.
+
+    Frozen-XI score:
+      - exactly the pre-deadline starting XI;
+      - no automatic substitutions;
+      - captain/vice fallback applies because that is part of the frozen decision;
+      - Triple Captain changes the captain multiplier; Bench Boost does not add bench
+        points to this frozen-XI number.
+
+    Final-realized replay:
+      - applies the authoritative frozen bench order and legal formation constraints;
+      - applies captain/vice fallback and the active chip;
+      - is deterministic from frozen submission + official player actuals;
+      - can later be verified against a live FPL account without changing this schema.
     """
-    frozen_xi_raw = sum(r["actual_points"] for r in starters)
-    frozen_xi_cap = captain_bonus(starters, captain_id, vice_id)
-    primary_actual_total = frozen_xi_raw + frozen_xi_cap["bonus_points"]
+    normalized_chip = str(chip).strip().lower().replace("-", "_").replace(" ", "_") if chip else None
+    if normalized_chip in {"", "none", "null", "no_chip"}:
+        normalized_chip = None
+    if normalized_chip not in {None, "wildcard", "free_hit", "triple_captain", "bench_boost"}:
+        raise RuntimeError("Unsupported chip for team evaluation: %s" % normalized_chip)
 
-    predicted_raw = sum(r["predicted_points"] for r in starters)
-    predicted_cap = next(r["predicted_points"] for r in starters if r["fpl_player_id"] == captain_id)
-    predicted_total = predicted_raw + predicted_cap
+    captain_multiplier = 3 if normalized_chip == "triple_captain" else 2
 
-    actions: List[Dict[str, Any]] = []
-    effective: Optional[List[Dict[str, Any]]]
-    if autosub_mode == "model_team":
-        effective, actions = apply_model_team_autosubs(starters, bench)
+    frozen_xi_raw = sum(float(r["actual_points"]) for r in starters)
+    frozen_xi_cap = _captain_result_with_multiplier(
+        starters, captain_id, vice_id, captain_multiplier
+    )
+    frozen_xi_score = frozen_xi_raw + float(frozen_xi_cap["bonus_points"])
+
+    predicted_raw = sum(float(r["predicted_points"]) for r in starters)
+    predicted_captain = next(
+        float(r["predicted_points"])
+        for r in starters
+        if r["fpl_player_id"] == captain_id
+    )
+    predicted_total = predicted_raw + predicted_captain * (captain_multiplier - 1)
+
+    # Always replay authoritative frozen bench order for both live FPL accounts.
+    standard_effective, autosub_actions = apply_model_team_autosubs(starters, bench)
+    standard_cap = _captain_result_with_multiplier(
+        standard_effective, captain_id, vice_id, 2
+    )
+    standard_realized_score = sum(float(r["actual_points"]) for r in standard_effective) + float(
+        standard_cap["bonus_points"]
+    )
+
+    if normalized_chip == "bench_boost":
+        final_effective = list(starters)
+        final_counted = list(squad)
+        final_cap = _captain_result_with_multiplier(
+            final_effective, captain_id, vice_id, 2
+        )
+        final_raw = sum(float(r["actual_points"]) for r in final_counted)
+        realized_score = final_raw + float(final_cap["bonus_points"])
+        autosub_status = "not_applicable_bench_boost_counts_all_15"
+        final_autosub_actions: List[Dict[str, Any]] = []
+    else:
+        final_effective = standard_effective
+        final_counted = final_effective
+        final_cap = _captain_result_with_multiplier(
+            final_effective, captain_id, vice_id, captain_multiplier
+        )
+        final_raw = sum(float(r["actual_points"]) for r in final_counted)
+        realized_score = final_raw + float(final_cap["bonus_points"])
         autosub_status = "evaluated_from_frozen_bench_order"
-    elif all(r["actual_minutes"] > 0 for r in starters):
-        effective = list(starters)
-        autosub_status = "not_needed_all_frozen_starters_played"
-    else:
-        effective = None
-        autosub_status = "not_evaluated_bench_order_not_authoritative"
+        final_autosub_actions = autosub_actions
 
-    if effective is not None:
-        secondary_raw: Optional[float] = sum(r["actual_points"] for r in effective)
-        secondary_cap = captain_bonus(effective, captain_id, vice_id)
-        secondary_total: Optional[float] = secondary_raw + secondary_cap["bonus_points"]
-        secondary_error: Optional[float] = secondary_total - predicted_total
-        effective_ids: Optional[List[int]] = [r["fpl_player_id"] for r in effective]
-    else:
-        secondary_raw = None
-        secondary_cap = None
-        secondary_total = None
-        secondary_error = None
-        effective_ids = None
+    frozen_ids = {int(r["fpl_player_id"]) for r in starters}
+    final_ids = {int(r["fpl_player_id"]) for r in final_counted}
+    autosub_in_ids = {
+        int(r["fpl_player_id"])
+        for r in final_effective
+        if int(r["fpl_player_id"]) not in frozen_ids
+    }
+    autosub_out_ids = frozen_ids - {int(r["fpl_player_id"]) for r in final_effective}
+
+    frozen_formation = formation_name(starters)
+    final_formation = formation_name(final_effective)
+    autosub_delta = (
+        sum(float(r["actual_points"]) for r in final_effective)
+        - frozen_xi_raw
+        if normalized_chip != "bench_boost"
+        else 0.0
+    )
+    chip_effect_points = realized_score - standard_realized_score
+    adjustment_delta = realized_score - frozen_xi_score
+
+    final_captain_id = final_cap.get("effective_captain_id")
+    player_rows: List[Dict[str, Any]] = []
+    bench_order_by_id = {
+        int(row["fpl_player_id"]): index for index, row in enumerate(bench)
+    }
+    for row in squad:
+        enriched = dict(row)
+        pid = int(row["fpl_player_id"])
+        is_captain = pid == final_captain_id
+        if pid in final_ids:
+            multiplier = captain_multiplier if is_captain else 1
+        else:
+            multiplier = 0
+        enriched.update(
+            {
+                "frozen_is_starter": pid in frozen_ids,
+                "frozen_bench_order": bench_order_by_id.get(pid),
+                "frozen_is_captain": pid == captain_id,
+                "frozen_is_vice_captain": pid == vice_id,
+                "autosub_in": pid in autosub_in_ids,
+                "autosub_out": pid in autosub_out_ids,
+                "final_counted": pid in final_ids,
+                "final_multiplier": int(multiplier),
+                "final_points_contribution": float(row["actual_points"]) * int(multiplier),
+            }
+        )
+        player_rows.append(enriched)
 
     return {
+        "team_evaluation_contract_version": "fpl_team_gameweek_evaluation_v1",
         "label": label,
-        "primary_scoring_contract": "frozen_starting_xi_no_autosub_plus_captain_vice_fallback",
-        "secondary_scoring_contract": "official_fpl_autosub_reference_when_evaluable",
-        "selected_15_actual_points_raw": sum(r["actual_points"] for r in squad),
+        "chip": normalized_chip,
+        "primary_scoring_contract": "frozen_starting_xi_no_autosub_with_frozen_chip_and_captain_vice_fallback",
+        "secondary_scoring_contract": "fpl_rules_replay_from_frozen_submission_and_official_actuals",
+        "selected_15_actual_points_raw": sum(float(r["actual_points"]) for r in squad),
         "frozen_starting_xi_actual_points_raw": frozen_xi_raw,
-        "frozen_xi_captain_bonus_actual_points": frozen_xi_cap["bonus_points"],
-        "primary_frozen_xi_actual_total": primary_actual_total,
+        "frozen_xi_captain_bonus_actual_points": float(frozen_xi_cap["bonus_points"]),
+        "primary_frozen_xi_actual_total": frozen_xi_score,
+        "frozen_xi_score": frozen_xi_score,
         "submitted_predicted_xi_points_raw": predicted_raw,
         "submitted_predicted_total_with_captain": predicted_total,
-        "primary_actual_minus_predicted_total": primary_actual_total - predicted_total,
-        "bench_actual_points_raw": sum(r["actual_points"] for r in bench),
+        "primary_actual_minus_predicted_total": frozen_xi_score - predicted_total,
+        "bench_actual_points_raw": sum(float(r["actual_points"]) for r in bench),
         "captain": next(r["web_name"] for r in squad if r["fpl_player_id"] == captain_id),
         "vice_captain": next(r["web_name"] for r in squad if r["fpl_player_id"] == vice_id),
         "primary_captain_result": frozen_xi_cap,
-        "secondary_official_fpl_available": effective is not None,
-        "secondary_post_autosub_xi_actual_points_raw": secondary_raw,
-        "secondary_official_fpl_captain_result": secondary_cap,
-        "secondary_official_fpl_realized_total": secondary_total,
-        "secondary_actual_minus_predicted_total": secondary_error,
+        "secondary_official_fpl_available": True,
+        "secondary_post_autosub_xi_actual_points_raw": final_raw,
+        "secondary_official_fpl_captain_result": final_cap,
+        "secondary_official_fpl_realized_total": realized_score,
+        "secondary_actual_minus_predicted_total": realized_score - predicted_total,
+        "rules_replayed_realized_score": realized_score,
+        "final_realized_score": realized_score,
+        "final_realized_score_source": "fpl_rules_replay_from_frozen_submission_and_official_actuals",
+        "official_realized_score": None,
+        "official_realized_score_status": "not_verified_against_live_fpl_account",
+        "official_realized_score_source": None,
+        "official_realized_score_matches_replay": None,
+        "adjustment_delta": adjustment_delta,
+        "autosub_adjustment_points": autosub_delta,
+        "chip_effect_points": chip_effect_points,
+        "captain_adjustment_points": float(final_cap["bonus_points"]) - float(frozen_xi_cap["bonus_points"]),
         "autosub_status": autosub_status,
-        "autosub_actions": actions,
+        "autosub_actions": final_autosub_actions,
+        "frozen_formation": frozen_formation,
+        "final_formation": final_formation,
+        "vice_captain_triggered": bool(final_cap.get("vice_triggered")),
         "frozen_starter_ids": [r["fpl_player_id"] for r in starters],
-        "secondary_effective_starter_ids": effective_ids,
+        "secondary_effective_starter_ids": [r["fpl_player_id"] for r in final_effective],
+        "final_counted_player_ids": [r["fpl_player_id"] for r in final_counted],
         "bench_ids": [r["fpl_player_id"] for r in bench],
-        "player_rows": squad,
+        "player_rows": player_rows,
     }
 
 

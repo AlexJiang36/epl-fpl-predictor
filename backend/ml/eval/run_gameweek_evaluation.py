@@ -41,9 +41,9 @@ from ml.eval.evaluate_gameweek_post import (
     write_csv,
 )
 
-POST_EVALUATION_VERSION = "fpl_gameweek_post_evaluation_v2"
+POST_EVALUATION_VERSION = "fpl_gameweek_post_evaluation_v3"
 ACTUALS_CONTRACT_VERSION = "fpl_gameweek_final_actuals_v1"
-POST_MANIFEST_VERSION = "fpl_gameweek_post_manifest_v2"
+POST_MANIFEST_VERSION = "fpl_gameweek_post_manifest_v3"
 POSITIONS = ("GKP", "DEF", "MID", "FWD")
 FPL_BASE = "https://fantasy.premierleague.com/api"
 
@@ -95,6 +95,14 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--actual-manifest", default=None)
     parser.add_argument("--output-dir", default=None)
+    parser.add_argument(
+        "--account-config",
+        default=None,
+        help=(
+            "Optional private FPL account mapping JSON. If omitted, the evaluator "
+            "looks for <planning-root>/live-fpl-accounts/<season>/accounts.json."
+        ),
+    )
     parser.add_argument("--resume", action="store_true")
     parser.add_argument(
         "--reuse-final-actuals-only",
@@ -229,6 +237,160 @@ def actuals_root(planning_root: Path, season: str, gw: int) -> Path:
 
 def evaluation_root(planning_root: Path, season: str, gw: int) -> Path:
     return planning_root / "gw-post" / season / ("gw%02d" % gw) / "evaluation"
+
+
+ACCOUNT_CONFIG_VERSION = "fpl_live_accounts_v1"
+FPL_ACTIVE_CHIP_MAP = {
+    "wildcard": "wildcard",
+    "freehit": "free_hit",
+    "free_hit": "free_hit",
+    "3xc": "triple_captain",
+    "triple_captain": "triple_captain",
+    "bboost": "bench_boost",
+    "bench_boost": "bench_boost",
+}
+
+
+def normalize_chip(value: Any) -> Optional[str]:
+    if value is None:
+        return None
+    if isinstance(value, Mapping):
+        if value.get("active") is False:
+            return None
+        value = first_value(value, ("name", "chip_id", "id", "active_chip"))
+        if value is None:
+            return None
+    text = str(value).strip().lower().replace("-", "_").replace(" ", "_")
+    if text in {"", "none", "null", "no_chip"}:
+        return None
+    return FPL_ACTIVE_CHIP_MAP.get(text, text)
+
+
+def extract_frozen_chip(payload: Mapping[str, Any]) -> Optional[str]:
+    selection = _selection_payload(payload)
+    for source in (selection, payload):
+        for key in ("chip", "active_chip", "chip_id"):
+            if key in source:
+                return normalize_chip(source.get(key))
+    return None
+
+
+def default_account_config_path(planning_root: Path, season: str) -> Path:
+    return planning_root / "live-fpl-accounts" / season / "accounts.json"
+
+
+def load_account_config(
+    planning_root: Path,
+    season: str,
+    explicit_path: Optional[Path] = None,
+) -> Optional[Dict[str, Any]]:
+    path = (
+        Path(explicit_path).expanduser().resolve()
+        if explicit_path
+        else default_account_config_path(planning_root, season)
+    )
+    if not path.is_file():
+        return None
+    payload = read_json(path)
+    if not isinstance(payload, Mapping):
+        raise GameweekEvaluationError("FPL account config root is not an object: %s" % path)
+    if payload.get("season") not in (None, season):
+        raise GameweekEvaluationError("FPL account config season mismatch: %s" % path)
+    accounts = payload.get("accounts")
+    if not isinstance(accounts, Mapping):
+        raise GameweekEvaluationError("FPL account config must contain an accounts object.")
+    normalized: Dict[str, Any] = {"path": str(path), "accounts": {}}
+    for team_kind in ("model_team", "team_alex"):
+        item = accounts.get(team_kind)
+        if item is None:
+            continue
+        if not isinstance(item, Mapping):
+            raise GameweekEvaluationError("FPL account config %s entry is invalid." % team_kind)
+        entry_id = as_int(item.get("entry_id"), 0)
+        if entry_id <= 0:
+            raise GameweekEvaluationError("FPL account config %s entry_id must be positive." % team_kind)
+        normalized["accounts"][team_kind] = {
+            "entry_id": entry_id,
+            "label": item.get("label"),
+        }
+    return normalized
+
+
+def fetch_official_account_event(entry_id: int, gw: int) -> Tuple[bytes, Dict[str, Any]]:
+    raw, payload = fetch_json_bytes(
+        "%s/entry/%s/event/%s/picks/" % (FPL_BASE, entry_id, gw)
+    )
+    if not isinstance(payload, Mapping):
+        raise GameweekEvaluationError("FPL account event response is not an object.")
+    if not isinstance(payload.get("picks"), list) or not isinstance(payload.get("entry_history"), Mapping):
+        raise GameweekEvaluationError("FPL account event response is missing picks/entry_history.")
+    return raw, dict(payload)
+
+
+def apply_official_account_event(
+    result: Dict[str, Any],
+    account_payload: Mapping[str, Any],
+    player_by_id: Mapping[int, Dict[str, Any]],
+) -> Dict[str, Any]:
+    picks = account_payload.get("picks") or []
+    official_ids: List[int] = []
+    gross = 0.0
+    multipliers: Dict[int, int] = {}
+    for pick in picks:
+        if not isinstance(pick, Mapping):
+            continue
+        pid = as_int(pick.get("element"), 0)
+        multiplier = as_int(pick.get("multiplier"), 0)
+        if pid <= 0 or pid not in player_by_id:
+            raise GameweekEvaluationError(
+                "Official FPL account pick is missing from player actuals: %s" % pid
+            )
+        multipliers[pid] = multiplier
+        if multiplier > 0:
+            official_ids.append(pid)
+            gross += float(player_by_id[pid]["actual_points"]) * multiplier
+
+    entry_history = account_payload.get("entry_history") or {}
+    transfer_cost = as_int(entry_history.get("event_transfers_cost"), 0)
+    net = gross - transfer_cost
+    reported = entry_history.get("points")
+    reported_points = float(reported) if reported is not None else None
+    official_chip = normalize_chip(account_payload.get("active_chip"))
+    frozen_chip = result.get("chip")
+    chip_matches = official_chip == frozen_chip
+
+    replay = float(result.get("rules_replayed_realized_score") or 0.0)
+    replay_delta = gross - replay
+    result.update(
+        {
+            "official_realized_score": gross,
+            "official_realized_score_status": (
+                "verified_match"
+                if abs(replay_delta) < 1e-9 and chip_matches
+                else "verified_official_authoritative_with_replay_difference"
+            ),
+            "official_realized_score_source": "official_fpl_entry_event_picks",
+            "official_realized_score_matches_replay": abs(replay_delta) < 1e-9,
+            "official_realized_score_replay_delta": replay_delta,
+            "official_active_chip": official_chip,
+            "official_chip_matches_frozen": chip_matches,
+            "official_net_gameweek_score_after_transfer_cost": net,
+            "official_transfer_cost_points": transfer_cost,
+            "official_entry_history_points": reported_points,
+            "official_entry_history_points_matches_net": (
+                abs(reported_points - net) < 1e-9
+                if reported_points is not None
+                else None
+            ),
+            "official_final_counted_player_ids": official_ids,
+            "official_pick_multipliers": {
+                str(pid): multipliers[pid] for pid in sorted(multipliers)
+            },
+            "final_realized_score": gross,
+            "final_realized_score_source": "official_fpl_entry_event_picks",
+        }
+    )
+    return result
 
 
 def _actual_manifest_candidates(root: Path) -> List[Path]:
@@ -1316,7 +1478,17 @@ def build_team_evaluation(
     squad_rows = [dict(player_by_id[pid]) for pid in ids]
     starter_rows = [dict(player_by_id[pid]) for pid in starters]
     bench_rows = [dict(player_by_id[pid]) for pid in bench]
-    result = evaluate_team(label, squad_rows, starter_rows, bench_rows, captain, vice, autosub_mode)
+    chip = extract_frozen_chip(payload)
+    result = evaluate_team(
+        label,
+        squad_rows,
+        starter_rows,
+        bench_rows,
+        captain,
+        vice,
+        autosub_mode,
+        chip=chip,
+    )
     result["source_state"] = source_state
     if state_path.suffix.lower() == ".zip":
         result["source_archive_sha256"] = sha256_file(state_path)
@@ -1563,13 +1735,21 @@ def build_markdown(result: Mapping[str, Any]) -> str:
             "",
             "## Model Team",
             "",
-            "- Frozen XI + captain actual: **%.1f**" % mt["primary_frozen_xi_actual_total"],
+            "- Chip: `%s`" % (mt.get("chip") or "null"),
+            "- Frozen XI score: **%.1f**" % mt["frozen_xi_score"],
+            "- Final realized score: **%.1f** (`%s`)"
+            % (mt["final_realized_score"], mt["final_realized_score_source"]),
+            "- Adjustment delta: **%+.1f**" % mt["adjustment_delta"],
             "- Predicted XI + captain: **%.3f**" % mt["submitted_predicted_total_with_captain"],
             "- Captain: **%s**; vice: **%s**" % (mt["captain"], mt["vice_captain"]),
             "",
             "## Team Alex",
             "",
-            "- Frozen XI + captain actual: **%.1f**" % ta["primary_frozen_xi_actual_total"],
+            "- Chip: `%s`" % (ta.get("chip") or "null"),
+            "- Frozen XI score: **%.1f**" % ta["frozen_xi_score"],
+            "- Final realized score: **%.1f** (`%s`)"
+            % (ta["final_realized_score"], ta["final_realized_score_source"]),
+            "- Adjustment delta: **%+.1f**" % ta["adjustment_delta"],
             "- Predicted XI + captain: **%.3f**" % ta["submitted_predicted_total_with_captain"],
             "- Captain: **%s**; vice: **%s**" % (ta["captain"], ta["vice_captain"]),
             "",
@@ -1614,6 +1794,7 @@ def run_gameweek_evaluation(
     actual_manifest_path: Path,
     output_dir: Optional[Path] = None,
     resume: bool = False,
+    account_config_path: Optional[Path] = None,
 ) -> Path:
     actual_manifest = validate_final_actual_manifest(actual_manifest_path, season, gw)
     existing = discover_final_evaluation(planning_root, season, gw)
@@ -1682,6 +1863,27 @@ def run_gameweek_evaluation(
         player_by_id,
         "team_alex",
     )
+
+    account_config = load_account_config(
+        planning_root,
+        season,
+        explicit_path=account_config_path,
+    )
+    official_account_payloads: Dict[str, Dict[str, Any]] = {}
+    official_account_raw: Dict[str, bytes] = {}
+    if account_config is not None:
+        for team_kind, team_result in (
+            ("model_team", model_team_result),
+            ("team_alex", team_alex_result),
+        ):
+            account = account_config["accounts"].get(team_kind)
+            if account is None:
+                continue
+            raw, payload = fetch_official_account_event(int(account["entry_id"]), gw)
+            official_account_raw[team_kind] = raw
+            official_account_payloads[team_kind] = payload
+            apply_official_account_event(team_result, payload, player_by_id)
+
     decision_result = build_decision_evaluation(
         baseline.model_team_decision,
         model_team_result,
@@ -1726,6 +1928,12 @@ def run_gameweek_evaluation(
             "team_alex_state": str(baseline.team_alex_state),
             "team_alex_state_sha256": sha256_file(baseline.team_alex_state),
             "model_team_decision": str(baseline.model_team_decision) if baseline.model_team_decision else None,
+        },
+        "official_account_evidence": {
+            "config_present": account_config is not None,
+            "config_path": account_config.get("path") if account_config else None,
+            "model_team_available": "model_team" in official_account_payloads,
+            "team_alex_available": "team_alex" in official_account_payloads,
         },
         "player_model": player_result,
         "match_model": match_result,
@@ -1789,6 +1997,70 @@ def run_gameweek_evaluation(
     write_json_new(out_dir / "model_team_evaluation.json", json_safe(model_team_result))
     write_json_new(out_dir / "team_alex_evaluation.json", json_safe(team_alex_result))
     write_json_new(out_dir / "decision_evaluation.json", json_safe(decision_result))
+    for team_kind, raw in official_account_raw.items():
+        write_bytes_new(
+            out_dir / ("%s_official_fpl_account_event.json" % team_kind),
+            raw,
+        )
+
+    team_player_fields = (
+        "fpl_player_id",
+        "player_name",
+        "web_name",
+        "position",
+        "team_short_name",
+        "predicted_points",
+        "actual_points",
+        "actual_minutes",
+        "frozen_is_starter",
+        "frozen_bench_order",
+        "frozen_is_captain",
+        "frozen_is_vice_captain",
+        "autosub_in",
+        "autosub_out",
+        "final_counted",
+        "final_multiplier",
+        "final_points_contribution",
+    )
+    write_csv(
+        out_dir / "model_team_player_rows.csv",
+        model_team_result["player_rows"],
+        team_player_fields,
+    )
+    write_csv(
+        out_dir / "team_alex_player_rows.csv",
+        team_alex_result["player_rows"],
+        team_player_fields,
+    )
+    team_summary_rows = []
+    for team_kind, team_result in (
+        ("model_team", model_team_result),
+        ("team_alex", team_alex_result),
+    ):
+        team_summary_rows.append(
+            {
+                "team_kind": team_kind,
+                "chip": team_result.get("chip"),
+                "frozen_xi_score": team_result.get("frozen_xi_score"),
+                "rules_replayed_realized_score": team_result.get("rules_replayed_realized_score"),
+                "official_realized_score": team_result.get("official_realized_score"),
+                "final_realized_score": team_result.get("final_realized_score"),
+                "final_realized_score_source": team_result.get("final_realized_score_source"),
+                "adjustment_delta": team_result.get("adjustment_delta"),
+                "autosub_adjustment_points": team_result.get("autosub_adjustment_points"),
+                "captain_adjustment_points": team_result.get("captain_adjustment_points"),
+                "chip_effect_points": team_result.get("chip_effect_points"),
+                "frozen_formation": team_result.get("frozen_formation"),
+                "final_formation": team_result.get("final_formation"),
+                "official_transfer_cost_points": team_result.get("official_transfer_cost_points"),
+                "official_net_gameweek_score_after_transfer_cost": team_result.get("official_net_gameweek_score_after_transfer_cost"),
+            }
+        )
+    write_csv(
+        out_dir / "team_evaluation_summary.csv",
+        team_summary_rows,
+        tuple(team_summary_rows[0].keys()),
+    )
 
     artifacts = []
     for path in sorted(p for p in out_dir.iterdir() if p.is_file()):
@@ -1815,6 +2087,9 @@ def run_gameweek_evaluation(
         "prediction_regeneration": False,
         "post_result_pre_reconstruction": False,
         "immutable": True,
+        "team_evaluation_contract_version": "fpl_team_gameweek_evaluation_v1",
+        "dashboard_ready": True,
+        "official_account_evidence_present": bool(official_account_payloads),
         "artifacts": artifacts,
     }
     write_json_new(out_dir / "evaluation_manifest.json", manifest)
@@ -1826,7 +2101,9 @@ def run_gameweek_evaluation(
     print("player_mae:", round(player_result["cohorts"]["all_eligible_players"]["mae"], 6))
     print("match_1x2_accuracy:", round(match_result["one_x_two_accuracy"], 6))
     print("model_team_primary_frozen_xi_total:", model_team_result["primary_frozen_xi_actual_total"])
+    print("model_team_final_realized_total:", model_team_result["final_realized_score"])
     print("team_alex_primary_frozen_xi_total:", team_alex_result["primary_frozen_xi_actual_total"])
+    print("team_alex_final_realized_total:", team_alex_result["final_realized_score"])
     print("leakage_safe: True")
     print("prediction_regeneration: False")
     print("post_result_pre_reconstruction: False")
@@ -1868,6 +2145,11 @@ def main() -> int:
         actual_manifest_path=actual_manifest_path,
         output_dir=output_dir,
         resume=bool(args.resume),
+        account_config_path=(
+            Path(args.account_config).expanduser().resolve()
+            if args.account_config
+            else None
+        ),
     )
     print("evaluation_dir:", result)
     return 0

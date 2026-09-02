@@ -11,6 +11,7 @@ from unittest.mock import patch
 
 from ml.eval.run_gameweek_evaluation import (
     LEGACY_TEAM_ALEX_ARCHIVE_CONTRACTS,
+    apply_official_account_event,
     GameweekEvaluationError,
     _discover_frozen_team_alex,
     build_decision_evaluation,
@@ -299,7 +300,82 @@ class GameweekEvaluationIntegrationTests(unittest.TestCase):
             self.assertIn("model_team", summary)
             self.assertIn("team_alex", summary)
             self.assertIn("decision_evaluation", summary)
+            self.assertIsNone(summary["model_team"]["chip"])
+            self.assertIsNone(summary["team_alex"]["chip"])
+            self.assertEqual(
+                summary["model_team"]["team_evaluation_contract_version"],
+                "fpl_team_gameweek_evaluation_v1",
+            )
+            self.assertTrue((output / "model_team_player_rows.csv").is_file())
+            self.assertTrue((output / "team_alex_player_rows.csv").is_file())
+            self.assertTrue((output / "team_evaluation_summary.csv").is_file())
             self.assertTrue(manifest["immutable"])
+            self.assertTrue(manifest["dashboard_ready"])
+            self.assertEqual(
+                manifest["team_evaluation_contract_version"],
+                "fpl_team_gameweek_evaluation_v1",
+            )
+
+    def test_default_private_account_config_captures_official_account_evidence(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            planning = Path(tmp) / "planning"
+            self.build_generic_final_snapshot(planning)
+            actual_manifest = self.build_actuals(planning)
+            config = planning / "live-fpl-accounts" / "2026_27" / "accounts.json"
+            self.write_json(
+                config,
+                {
+                    "schema_version": "fpl_live_accounts_v1",
+                    "season": "2026_27",
+                    "accounts": {
+                        "model_team": {"entry_id": 111},
+                        "team_alex": {"entry_id": 222},
+                    },
+                },
+            )
+            selection = self.selection()
+            picks = []
+            for row in self.player_rows():
+                pid = int(row["fpl_player_id"])
+                multiplier = 0
+                if pid in selection["starting_xi_player_ids"]:
+                    multiplier = 2 if pid == selection["captain_player_id"] else 1
+                picks.append({"element": pid, "multiplier": multiplier})
+            actual_points = {pid: pid % 7 for pid in range(1, 16)}
+            gross = sum(actual_points[p["element"]] * p["multiplier"] for p in picks)
+            payload = {
+                "active_chip": None,
+                "picks": picks,
+                "entry_history": {
+                    "event_transfers_cost": 0,
+                    "points": gross,
+                },
+            }
+            raw = json.dumps(payload).encode("utf-8")
+            with patch(
+                "ml.eval.run_gameweek_evaluation.fetch_official_account_event",
+                side_effect=[(raw, payload), (raw, payload)],
+            ) as fetch_account:
+                output = run_gameweek_evaluation(
+                    planning_root=planning,
+                    season="2026_27",
+                    gw=2,
+                    actual_manifest_path=actual_manifest,
+                )
+            self.assertEqual(fetch_account.call_count, 2)
+            summary = json.loads((output / "evaluation_summary.json").read_text())
+            self.assertTrue(summary["official_account_evidence"]["model_team_available"])
+            self.assertTrue(summary["official_account_evidence"]["team_alex_available"])
+            self.assertEqual(
+                summary["model_team"]["official_realized_score_status"],
+                "verified_match",
+            )
+            self.assertEqual(
+                summary["model_team"]["final_realized_score_source"],
+                "official_fpl_entry_event_picks",
+            )
+            self.assertTrue((output / "model_team_official_fpl_account_event.json").is_file())
+            self.assertTrue((output / "team_alex_official_fpl_account_event.json").is_file())
 
     def test_day128b_match_schema_uses_frozen_match_xg_and_partial_scoreline_ranks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -487,6 +563,122 @@ class GameweekEvaluationIntegrationTests(unittest.TestCase):
                 result["transfer_no_transfer"]["counterfactual_status"],
                 "not_available_frozen_counterfactual_lineup_missing",
             )
+
+    def test_team_alex_autosub_replay_uses_frozen_bench_order(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "team_alex.json"
+            starters = [1, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14]
+            bench = [2, 6, 7, 15]
+            self.write_json(
+                state_path,
+                {
+                    "starting_xi": [{"name": "P%s" % i} for i in starters],
+                    "bench": [{"name": "P%s" % i} for i in bench],
+                    "captain": "P13",
+                    "vice_captain": "P14",
+                    "chip": None,
+                },
+            )
+            player_by_id = {}
+            for row in self.player_rows():
+                pid = row["fpl_player_id"]
+                actual_points = 2
+                actual_minutes = 90
+                if pid == 8:
+                    actual_points = 0
+                    actual_minutes = 0
+                if pid == 6:
+                    actual_points = 12
+                player_by_id[pid] = {
+                    **row,
+                    "player_name": "P%s" % pid,
+                    "web_name": "P%s" % pid,
+                    "actual_points": actual_points,
+                    "actual_minutes": actual_minutes,
+                }
+            result = build_team_evaluation(
+                "Team Alex / Gliding Tiger",
+                state_path,
+                player_by_id,
+                "team_alex",
+            )
+            self.assertIsNone(result["chip"])
+            self.assertEqual(result["rules_replayed_realized_score"] - result["frozen_xi_score"], 12.0)
+            self.assertEqual(result["adjustment_delta"], 12.0)
+            self.assertEqual(result["autosub_actions"][0]["out"], "P8")
+            self.assertEqual(result["autosub_actions"][0]["in"], "P6")
+            self.assertTrue(result["secondary_official_fpl_available"])
+
+    def test_free_hit_and_triple_captain_are_first_class_chip_values(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            state_path = Path(tmp) / "team.json"
+            starters = [1, 3, 4, 5, 8, 9, 10, 11, 12, 13, 14]
+            bench = [2, 6, 7, 15]
+            self.write_json(
+                state_path,
+                {
+                    "starting_xi": [{"name": "P%s" % i} for i in starters],
+                    "bench": [{"name": "P%s" % i} for i in bench],
+                    "captain": "P13",
+                    "vice_captain": "P14",
+                    "chip": {"name": "triple_captain", "active": True},
+                },
+            )
+            player_by_id = {}
+            for row in self.player_rows():
+                pid = row["fpl_player_id"]
+                player_by_id[pid] = {
+                    **row,
+                    "player_name": "P%s" % pid,
+                    "web_name": "P%s" % pid,
+                    "actual_points": 4 if pid == 13 else 1,
+                    "actual_minutes": 90,
+                }
+            result = build_team_evaluation(
+                "Model Team", state_path, player_by_id, "model_team"
+            )
+            self.assertEqual(result["chip"], "triple_captain")
+            self.assertEqual(result["primary_captain_result"]["captain_multiplier"], 3)
+            self.assertEqual(result["chip_effect_points"], 4.0)
+
+    def test_official_fpl_account_event_overrides_final_source_and_keeps_replay(self) -> None:
+        player_by_id = {
+            index: {
+                "fpl_player_id": index,
+                "actual_points": index,
+            }
+            for index in range(1, 16)
+        }
+        result = {
+            "chip": None,
+            "rules_replayed_realized_score": 80.0,
+            "final_realized_score": 80.0,
+            "final_realized_score_source": "fpl_rules_replay_from_frozen_submission_and_official_actuals",
+        }
+        picks = []
+        # Official multipliers produce gross 80: P1 captain (2x), P2-P11 normal.
+        for index in range(1, 16):
+            multiplier = 0
+            if index == 1:
+                multiplier = 2
+            elif 2 <= index <= 11:
+                multiplier = 1
+            picks.append({"element": index, "multiplier": multiplier})
+        gross = 2 * 1 + sum(range(2, 12))
+        payload = {
+            "active_chip": None,
+            "picks": picks,
+            "entry_history": {
+                "event_transfers_cost": 4,
+                "points": gross - 4,
+            },
+        }
+        apply_official_account_event(result, payload, player_by_id)
+        self.assertEqual(result["official_realized_score"], float(gross))
+        self.assertEqual(result["official_net_gameweek_score_after_transfer_cost"], float(gross - 4))
+        self.assertEqual(result["final_realized_score_source"], "official_fpl_entry_event_picks")
+        self.assertEqual(result["rules_replayed_realized_score"], 80.0)
+        self.assertFalse(result["official_realized_score_matches_replay"])
 
     def test_legacy_gw2_team_alex_zip_is_sha_pinned_and_discovered(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
