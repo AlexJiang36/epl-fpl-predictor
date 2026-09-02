@@ -6,6 +6,7 @@ import sys
 import tempfile
 import time
 import unittest
+from datetime import datetime
 from pathlib import Path
 from unittest.mock import Mock, patch
 
@@ -33,6 +34,13 @@ from ml.pipeline.run_fpl_refresh import (
     run_pre,
     run_post_pipeline,
     selection_eligibility_from_live_prediction,
+    candidate_resume_compatibility,
+    candidate_resume_fingerprint,
+    discover_final_freeze,
+    inspect_auto_state,
+    validate_final_freeze_candidate,
+    run_final_freeze_from_candidate,
+    run_unified_refresh,
 )
 from ml.contracts.squad_state import (
     ChipInventoryState,
@@ -1030,6 +1038,425 @@ class UnifiedPostPipelineIntegrationTests(unittest.TestCase):
             self.assertEqual(result, evaluation_dir)
             self.assertTrue(capture_mock.call_args.kwargs["reuse_only"])
             self.assertFalse(capture_mock.call_args.kwargs["reuse_existing"])
+
+
+class UnifiedAutoResumeManifestTests(unittest.TestCase):
+    def _candidate_package(
+        self,
+        root: Path,
+        *,
+        season: str = "2026_27",
+        gw: int = 3,
+        top_n: int = 30,
+        max_transfers: int = 2,
+    ) -> Path:
+        planning = root / "planning"
+        prediction = (
+            planning
+            / "gw-pre"
+            / season
+            / ("gw%02d" % gw)
+            / "early-season"
+            / "prediction_run"
+        )
+        prediction.mkdir(parents=True)
+        bootstrap = {
+            "events": [
+                {
+                    "id": gw,
+                    "deadline_time": "2099-09-05T10:00:00Z",
+                }
+            ]
+        }
+        (prediction / "bootstrap_snapshot.json").write_text(
+            json.dumps(bootstrap), encoding="utf-8"
+        )
+        (prediction / "player_predictions_preview.csv").write_text(
+            "fpl_player_id,predicted_points\n1,5.0\n", encoding="utf-8"
+        )
+        (prediction / "match_predictions_preview.csv").write_text(
+            "fixture_id\n1\n", encoding="utf-8"
+        )
+        (prediction / "scoreline_preview.csv").write_text(
+            "fixture_id\n1\n", encoding="utf-8"
+        )
+        prediction_manifest = {
+            "status": "PASS_PREVIEW",
+            "season": season,
+            "target_gw": gw,
+            "prediction_mode": "early_season_blend",
+            "preview_only": True,
+            "database_prediction_write": False,
+            "created_at": "2099-09-04T10:00:00Z",
+            "outputs": {
+                "player_predictions_preview": "player_predictions_preview.csv",
+                "match_predictions_preview": "match_predictions_preview.csv",
+                "scoreline_preview": "scoreline_preview.csv",
+                "bootstrap_snapshot": "bootstrap_snapshot.json",
+            },
+        }
+        prediction_manifest_path = prediction / "run_manifest.json"
+        prediction_manifest_path.write_text(
+            json.dumps(prediction_manifest), encoding="utf-8"
+        )
+
+        previous = (
+            planning
+            / "frozen-snapshots"
+            / season
+            / ("gw%02d" % (gw - 1))
+            / "model-team"
+            / "previous"
+        )
+        previous.mkdir(parents=True)
+        previous_state = previous / "model_team_state.json"
+        previous_state.write_text("{}", encoding="utf-8")
+
+        package = (
+            planning
+            / "gw-pre"
+            / season
+            / ("gw%02d" % gw)
+            / "candidate-package"
+            / "candidate_run"
+        )
+        package.mkdir(parents=True)
+        (package / "current_owned_squad_state.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        (package / "free_transfer_ledger_state.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        (package / "transfer_decision.json").write_text(
+            "{}", encoding="utf-8"
+        )
+        (package / "match_model_source").mkdir()
+
+        import hashlib
+
+        def sha(path):
+            return hashlib.sha256(path.read_bytes()).hexdigest()
+
+        components = {
+            "season": season,
+            "target_gw": gw,
+            "resolved_prediction_mode": "early_season_blend",
+            "configured_max_transfers": max_transfers,
+            "configured_candidate_top_n": top_n,
+            "input_fingerprints": {
+                "prediction_manifest": sha(prediction_manifest_path),
+                "previous_frozen_model_team": sha(previous_state),
+            },
+        }
+        from ml.validation.export_refresh_manifest import stable_fingerprint
+
+        manifest = {
+            "status": "PASS_PRE_CANDIDATE",
+            "season": season,
+            "target_gw": gw,
+            "resolved_prediction_mode": "early_season_blend",
+            "configured_max_transfers": max_transfers,
+            "configured_candidate_top_n": top_n,
+            "final_deadline_freeze": False,
+            "inputs": {
+                "prediction_run": str(prediction),
+                "prediction_manifest": str(prediction_manifest_path),
+                "previous_frozen_model_team": str(previous_state),
+                "current_owned_state": str(
+                    package / "current_owned_squad_state.json"
+                ),
+            },
+            "input_fingerprints": components["input_fingerprints"],
+            "transfer_decision": str(package / "transfer_decision.json"),
+            "resume": {
+                "fingerprint": stable_fingerprint(components),
+                "components": components,
+            },
+        }
+        (package / "run_manifest.json").write_text(
+            json.dumps(manifest), encoding="utf-8"
+        )
+        return package
+
+
+    def _auto_args(self, *, resume: bool = True, final_freeze: bool = True) -> argparse.Namespace:
+        return argparse.Namespace(
+            phase="auto",
+            season="2026_27",
+            target_gw=3,
+            resume=resume,
+            final_freeze=final_freeze,
+            skip_live_refresh=True,
+            base_url="",
+            api_port=8765,
+        )
+
+    def _previous_final_evaluation(self, planning: Path) -> Path:
+        result = (
+            planning
+            / "gw-post"
+            / "2026_27"
+            / "gw02"
+            / "evaluation"
+            / "final_previous"
+        )
+        result.mkdir(parents=True)
+        (result / "evaluation_summary.json").write_text("{}", encoding="utf-8")
+        (result / "evaluation_manifest.json").write_text(
+            json.dumps({"status": "FINAL", "immutable": True}),
+            encoding="utf-8",
+        )
+        return result
+
+    def test_later_stage_failure_preserves_successful_candidate_and_active_pointer(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            planning = root / "planning"
+            candidate = self._candidate_package(root)
+            self._previous_final_evaluation(planning)
+
+            with patch(
+                "ml.pipeline.run_fpl_refresh.run_pre",
+                return_value=candidate,
+            ), patch(
+                "ml.pipeline.run_fpl_refresh.run_final_freeze_from_candidate",
+                side_effect=RuntimeError("synthetic freeze failure"),
+            ):
+                with self.assertRaisesRegex(RuntimeError, "synthetic freeze failure"):
+                    run_unified_refresh(
+                        args=self._auto_args(),
+                        repo_root=root,
+                        planning_root=planning,
+                        python_exe=sys.executable,
+                        env={},
+                    )
+
+            manifests = sorted(
+                (planning / "refresh-runs" / "2026_27" / "gw03").glob(
+                    "*/refresh_manifest.json"
+                )
+            )
+            self.assertEqual(len(manifests), 1)
+            payload = json.loads(manifests[0].read_text(encoding="utf-8"))
+            self.assertEqual(payload["status"], "FAILED")
+            self.assertEqual(payload["candidate_run_id"], candidate.name)
+            self.assertEqual(payload["active_run_id"], candidate.name)
+            self.assertEqual(payload["outputs"]["candidate"], str(candidate))
+            self.assertEqual(payload["outputs"]["active"], str(candidate))
+            self.assertEqual(payload["failure"]["message"], "synthetic freeze failure")
+            self.assertTrue(candidate.is_dir())
+
+    def test_recovery_after_later_stage_failure_can_resume_from_preserved_candidate(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            planning = root / "planning"
+            candidate = self._candidate_package(root)
+            self._previous_final_evaluation(planning)
+            with patch(
+                "ml.pipeline.run_fpl_refresh.run_pre",
+                return_value=candidate,
+            ), patch(
+                "ml.pipeline.run_fpl_refresh.run_final_freeze_from_candidate",
+                side_effect=RuntimeError("synthetic freeze failure"),
+            ):
+                with self.assertRaises(RuntimeError):
+                    run_unified_refresh(
+                        args=self._auto_args(),
+                        repo_root=root,
+                        planning_root=planning,
+                        python_exe=sys.executable,
+                        env={},
+                    )
+
+            recovered_final = root / "recovered_final"
+            recovered_final.mkdir()
+            with patch(
+                "ml.pipeline.run_fpl_refresh.run_pre",
+                return_value=candidate,
+            ) as pre, patch(
+                "ml.pipeline.run_fpl_refresh.run_final_freeze_from_candidate",
+                return_value=recovered_final,
+            ):
+                result = run_unified_refresh(
+                    args=self._auto_args(resume=True, final_freeze=True),
+                    repo_root=root,
+                    planning_root=planning,
+                    python_exe=sys.executable,
+                    env={},
+                )
+
+            self.assertEqual(result["status"], "PASS")
+            self.assertEqual(result["action"], "PRE_THEN_FINAL_FREEZE")
+            self.assertEqual(result["candidate_run_id"], candidate.name)
+            self.assertEqual(result["active_run_id"], recovered_final.name)
+            self.assertEqual(result["candidate"], candidate)
+            self.assertEqual(result["active"], recovered_final)
+            pre.assert_called_once()
+
+    def test_candidate_resume_uses_fingerprints_and_rejects_drift(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            package = self._candidate_package(root)
+            planning = root / "planning"
+
+            with patch(
+                "ml.pipeline.run_fpl_refresh.discover_previous_model_team_state",
+                return_value=(
+                    Mock(),
+                    Path(
+                        json.loads((package / "run_manifest.json").read_text())[
+                            "inputs"
+                        ]["previous_frozen_model_team"]
+                    ),
+                    "canonical",
+                ),
+            ):
+                result = candidate_resume_compatibility(
+                    package,
+                    planning_root=planning,
+                    season="2026_27",
+                    target_gw=3,
+                    max_transfers=2,
+                    candidate_top_n=30,
+                )
+            self.assertTrue(result["compatible"])
+            self.assertEqual(
+                result["fingerprint"],
+                candidate_resume_fingerprint(package),
+            )
+
+            manifest = json.loads((package / "run_manifest.json").read_text())
+            prediction_manifest = Path(manifest["inputs"]["prediction_manifest"])
+            prediction_manifest.write_text(
+                prediction_manifest.read_text() + "\n", encoding="utf-8"
+            )
+            with patch(
+                "ml.pipeline.run_fpl_refresh.discover_previous_model_team_state",
+                return_value=(
+                    Mock(),
+                    Path(manifest["inputs"]["previous_frozen_model_team"]),
+                    "canonical",
+                ),
+            ):
+                drifted = candidate_resume_compatibility(
+                    package,
+                    planning_root=planning,
+                    season="2026_27",
+                    target_gw=3,
+                    max_transfers=2,
+                    candidate_top_n=30,
+                )
+            self.assertFalse(drifted["compatible"])
+            self.assertTrue(
+                any("fingerprint changed" in reason for reason in drifted["reasons"])
+            )
+
+    def test_auto_state_prefers_previous_post_before_pre(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            planning = Path(temporary_directory) / "planning"
+            planning.mkdir()
+            state = inspect_auto_state(
+                planning,
+                season="2026_27",
+                target_gw=3,
+            )
+            self.assertEqual(state["resolved_action"], "POST_THEN_PRE")
+            self.assertIsNone(state["previous_final_evaluation"])
+
+    def test_auto_state_noops_when_target_final_freeze_exists(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            planning = Path(temporary_directory) / "planning"
+            freeze = (
+                planning
+                / "frozen-snapshots"
+                / "2026_27"
+                / "gw03"
+                / "model-team"
+                / "final"
+            )
+            freeze.mkdir(parents=True)
+            (freeze / "freeze_manifest.json").write_text(
+                json.dumps(
+                    {
+                        "season": "2026_27",
+                        "target_gw": 3,
+                        "snapshot_kind": "final_pre_deadline",
+                        "final_pre_deadline_snapshot_frozen": True,
+                    }
+                ),
+                encoding="utf-8",
+            )
+            self.assertEqual(
+                discover_final_freeze(planning, "2026_27", 3),
+                freeze,
+            )
+            state = inspect_auto_state(
+                planning,
+                season="2026_27",
+                target_gw=3,
+            )
+            self.assertEqual(
+                state["resolved_action"],
+                "POST_CATCHUP_IF_NEEDED_THEN_NOOP",
+            )
+
+    def test_final_freeze_window_rejects_after_deadline(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            package = self._candidate_package(root)
+            with self.assertRaisesRegex(RuntimeError, "deadline has already passed"):
+                validate_final_freeze_candidate(
+                    package,
+                    season="2026_27",
+                    target_gw=3,
+                    now_utc=datetime.fromisoformat(
+                        "2100-01-01T00:00:00+00:00"
+                    ),
+                )
+
+    def test_final_freeze_calls_day127b_exporter_with_explicit_final_true(self) -> None:
+        with tempfile.TemporaryDirectory() as temporary_directory:
+            root = Path(temporary_directory)
+            package = self._candidate_package(root)
+            planning = root / "planning"
+            previous_state = Mock()
+            result_dir = root / "final_snapshot"
+            result_dir.mkdir()
+            result = {
+                "snapshot_dir": str(result_dir),
+                "manifest_path": str(result_dir / "freeze_manifest.json"),
+                "final_pre_deadline_snapshot_frozen": True,
+            }
+            recorder = StageRecorder()
+            manifest = json.loads((package / "run_manifest.json").read_text())
+
+            with patch(
+                "ml.pipeline.run_fpl_refresh._load_previous_state_for_candidate",
+                return_value=previous_state,
+            ), patch(
+                "ml.pipeline.run_fpl_refresh.export_gameweek_pre_deadline_snapshot",
+                return_value=result,
+            ) as exporter:
+                freeze = run_final_freeze_from_candidate(
+                    planning_root=planning,
+                    season="2026_27",
+                    target_gw=3,
+                    candidate_dir=package,
+                    recorder=recorder,
+                    resume=False,
+                )
+
+            self.assertEqual(freeze, result_dir)
+            self.assertTrue(exporter.call_args.kwargs["final_freeze"])
+            self.assertEqual(
+                exporter.call_args.kwargs["previous_model_team_state"],
+                previous_state,
+            )
+            stage_names = [row["stage"] for row in recorder.rows]
+            self.assertEqual(
+                stage_names,
+                ["freeze_window_validation", "final_freeze_export"],
+            )
 
 
 if __name__ == "__main__":

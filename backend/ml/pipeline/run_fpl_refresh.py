@@ -47,17 +47,25 @@ from ml.validation.export_gameweek_pre_deadline_snapshot import (
     export_gameweek_pre_deadline_snapshot,
 )
 from ml.validation.resolve_prediction_mode import resolve_prediction_mode
+from ml.validation.export_refresh_manifest import (
+    REFRESH_MANIFEST_VERSION,
+    RefreshManifestWriter,
+    manifest_stage_summary,
+    stable_fingerprint,
+)
 
 
-RUNNER_VERSION = "fpl_weekly_runner_v0_3"
+RUNNER_VERSION = "fpl_weekly_runner_v0_4"
 PRE_INTEGRATION_VERSION = "fpl_pre_pipeline_integration_v1"
 POST_INTEGRATION_VERSION = "fpl_post_pipeline_integration_v1"
+AUTO_INTEGRATION_VERSION = "fpl_auto_resume_manifest_v1"
 ELIGIBILITY_ADAPTER_VERSION = "fpl_live_selection_eligibility_v1"
 LEGACY_GW2_STATE_ADAPTER_VERSION = "legacy_gw2_model_team_to_squad_state_v1"
 DAG_VERSION = "fpl_gameweek_dag_v1"
 POSITIONS = ("GKP", "DEF", "MID", "FWD")
 VALID_PHASES = ("pre", "freeze", "post", "auto", "status")
 FAIL_FAST = True
+CLI_VERBOSE = False
 
 
 class GameweekDAGError(RuntimeError):
@@ -585,8 +593,8 @@ def parse_args() -> argparse.Namespace:
         "--final-freeze",
         action="store_true",
         help=(
-            "Explicit authorization for a FINAL freeze. Day128A dry-run can plan "
-            "this stage; live runner wiring remains fail-closed until integration."
+            "Explicit authorization for a deadline-FINAL freeze. It is legal only "
+            "with --phase freeze or --phase auto and is never inferred automatically."
         ),
     )
     p.add_argument(
@@ -616,6 +624,11 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     p.add_argument("--position-top-n", type=int, default=10)
+    p.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Print child-command/stdout detail. Default weekly output is concise.",
+    )
     return p.parse_args()
 
 
@@ -719,6 +732,8 @@ class StageRecorder:
         dependencies: Optional[Sequence[str]] = None,
         planned_inputs: Optional[Sequence[str]] = None,
         planned_outputs: Optional[Sequence[str]] = None,
+        fingerprint: Optional[str] = None,
+        skip_reason: str = "",
     ) -> None:
         ended = time.time()
         started_at = datetime.fromtimestamp(started, timezone.utc)
@@ -737,6 +752,8 @@ class StageRecorder:
                 "planned_inputs": list(planned_inputs or []),
                 "planned_outputs": list(planned_outputs or []),
                 "outputs": list(outputs or []),
+                "fingerprint": fingerprint,
+                "skip_reason": skip_reason or None,
                 "note": note,
             }
         )
@@ -752,7 +769,8 @@ def run_command(
 ) -> str:
     started = time.time()
     printable = " ".join(parts)
-    print("\n[%s] %s" % (name, printable))
+    if CLI_VERBOSE:
+        print("\n[%s] %s" % (name, printable))
     if dry_run:
         recorder.add(name, "DRY_RUN", started, note=printable)
         return ""
@@ -765,9 +783,9 @@ def run_command(
         capture_output=True,
         check=False,
     )
-    if proc.stdout:
+    if CLI_VERBOSE and proc.stdout:
         print(proc.stdout.rstrip())
-    if proc.stderr:
+    if CLI_VERBOSE and proc.stderr:
         print(proc.stderr.rstrip(), file=sys.stderr)
     if proc.returncode != 0:
         recorder.add(name, "FAILED", started, note="exit=%s" % proc.returncode)
@@ -852,7 +870,8 @@ def refresh_live_data(
     for name, suffix in endpoints:
         started = time.time()
         url = base_url + suffix
-        print("\n[%s] POST %s" % (name, url))
+        if CLI_VERBOSE:
+            print("\n[%s] POST %s" % (name, url))
         if dry_run:
             recorder.add(name, "DRY_RUN", started, note=url)
             continue
@@ -915,7 +934,8 @@ def run_prediction_stage(
             outputs=[str(existing)],
             note="--resume reused latest complete preview artifact.",
         )
-        print("\n[early_season_predictions] REUSED %s" % existing)
+        if CLI_VERBOSE:
+            print("\n[early_season_predictions] REUSED %s" % existing)
         return existing
 
     before = set()
@@ -1030,7 +1050,8 @@ def publish_predictions_if_requested(
             outputs=[str(existing)],
             note="Existing publish receipt matches source run.",
         )
-        print("\n[publish_predictions] REUSED %s" % existing)
+        if CLI_VERBOSE:
+            print("\n[publish_predictions] REUSED %s" % existing)
         return existing
 
     module = "ml.validation.publish_early_season_predictions"
@@ -2013,6 +2034,7 @@ def write_formal_pre_manifest(
     recorder: StageRecorder,
     publish_requested: bool,
     max_transfers: int,
+    candidate_top_n: int,
     status: str = "PASS_PRE_CANDIDATE",
     blocker: str = "",
 ) -> Path:
@@ -2031,6 +2053,18 @@ def write_formal_pre_manifest(
         if path.is_file():
             fingerprints[key] = sha256_file(path)
 
+    resume_components = {
+        "season": str(season),
+        "target_gw": int(target_gw),
+        "resolved_prediction_mode": prediction_mode_result.get(
+            "resolved_prediction_mode"
+        ),
+        "configured_max_transfers": int(max_transfers),
+        "configured_candidate_top_n": int(candidate_top_n),
+        "input_fingerprints": dict(fingerprints),
+    }
+    resume_fingerprint = stable_fingerprint(resume_components)
+
     payload = {
         "artifact_type": "fpl_unified_pre_candidate_package",
         "artifact_version": PRE_INTEGRATION_VERSION,
@@ -2047,8 +2081,14 @@ def write_formal_pre_manifest(
         ),
         "publish_predictions_requested": bool(publish_requested),
         "configured_max_transfers": int(max_transfers),
+        "configured_candidate_top_n": int(candidate_top_n),
         "inputs": inputs,
         "input_fingerprints": fingerprints,
+        "resume": {
+            "fingerprint_version": "fpl_pre_candidate_resume_v1",
+            "fingerprint": resume_fingerprint,
+            "components": resume_components,
+        },
         "previous_squad_state": {
             "state_id": previous_state.state_id,
             "owned_state_fingerprint": previous_state.owned_state_fingerprint,
@@ -2373,7 +2413,8 @@ def run_post_pipeline(
             planned_outputs=("immutable_post_gameweek_evaluation_package",),
             note="Existing FINAL Day129A POST evaluation reused.",
         )
-        print("\n[post_evaluation] REUSED %s" % existing)
+        if CLI_VERBOSE:
+            print("\n[post_evaluation] REUSED %s" % existing)
         return existing
 
     api_proc: Optional[subprocess.Popen] = None
@@ -2476,7 +2517,8 @@ def run_post_evaluation(
             outputs=[str(existing)],
             note="Existing FINAL Day129A POST evaluation reused.",
         )
-        print("\n[post_evaluation] REUSED %s" % existing)
+        if CLI_VERBOSE:
+            print("\n[post_evaluation] REUSED %s" % existing)
         return existing
 
     actual_manifest = discover_final_actual_manifest(planning_root, season, gw)
@@ -2487,7 +2529,8 @@ def run_post_evaluation(
             time.time(),
             note="AUTO catch-up found no separately captured FINAL actual manifest.",
         )
-        print("\n[post_evaluation] SKIPPED: no FINAL actual manifest for GW%s." % gw)
+        if CLI_VERBOSE:
+            print("\n[post_evaluation] SKIPPED: no FINAL actual manifest for GW%s." % gw)
         return None
 
     started = time.time()
@@ -2571,6 +2614,749 @@ def find_reusable_candidate_package(
     ]
     return latest_path(dirs)
 
+
+
+
+def _parse_utc(value: str) -> datetime:
+    raw = str(value or "").strip()
+    if not raw:
+        raise RuntimeError("Missing UTC timestamp.")
+    if raw.endswith("Z"):
+        raw = raw[:-1] + "+00:00"
+    parsed = datetime.fromisoformat(raw)
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def discover_final_freeze(
+    planning_root: Path,
+    season: str,
+    gw: int,
+) -> Optional[Path]:
+    """Discover a true deadline-FINAL snapshot; never treat a PRE candidate as FINAL."""
+
+    base = (
+        planning_root
+        / "frozen-snapshots"
+        / str(season)
+        / ("gw%02d" % int(gw))
+    )
+    if not base.is_dir():
+        return None
+
+    candidates: List[Path] = []
+    for path in base.rglob("*.json"):
+        if path.name not in ("freeze_manifest.json", "snapshot_manifest.json", "manifest.json"):
+            continue
+        try:
+            payload = read_json(path)
+        except Exception:
+            continue
+        is_final = (
+            payload.get("final_pre_deadline_snapshot_frozen") is True
+            or str(payload.get("snapshot_kind") or "") == "final_pre_deadline"
+            or payload.get("final_deadline_freeze") is True
+        )
+        if not is_final:
+            continue
+        payload_season = payload.get("season")
+        payload_gw = payload.get("target_gw", payload.get("gw"))
+        if payload_season not in (None, str(season)):
+            continue
+        if payload_gw is not None and int(payload_gw) != int(gw):
+            continue
+        candidates.append(path.parent)
+
+    return latest_path(candidates)
+
+
+def candidate_resume_fingerprint(package_dir: Path) -> str:
+    manifest = read_json(Path(package_dir) / "run_manifest.json")
+    resume = manifest.get("resume")
+    if isinstance(resume, Mapping) and str(resume.get("fingerprint") or ""):
+        return str(resume["fingerprint"])
+
+    components = {
+        "season": str(manifest.get("season") or ""),
+        "target_gw": int(manifest.get("target_gw") or -1),
+        "resolved_prediction_mode": manifest.get("resolved_prediction_mode"),
+        "configured_max_transfers": manifest.get("configured_max_transfers"),
+        "configured_candidate_top_n": manifest.get("configured_candidate_top_n"),
+        "input_fingerprints": dict(manifest.get("input_fingerprints") or {}),
+    }
+    return stable_fingerprint(components)
+
+
+def candidate_resume_compatibility(
+    package_dir: Path,
+    *,
+    planning_root: Path,
+    season: str,
+    target_gw: int,
+    max_transfers: int,
+    candidate_top_n: int,
+) -> Dict[str, Any]:
+    """Validate resume using artifact identity/fingerprints instead of age alone."""
+
+    package = Path(package_dir).resolve()
+    manifest_path = package / "run_manifest.json"
+    reasons: List[str] = []
+    if not manifest_path.is_file():
+        return {
+            "compatible": False,
+            "fingerprint": None,
+            "reasons": ["candidate run_manifest.json is missing"],
+        }
+
+    manifest = read_json(manifest_path)
+    if str(manifest.get("status") or "") != "PASS_PRE_CANDIDATE":
+        reasons.append("candidate status is not PASS_PRE_CANDIDATE")
+    if str(manifest.get("season") or "") != str(season):
+        reasons.append("candidate season differs")
+    if int(manifest.get("target_gw") or -1) != int(target_gw):
+        reasons.append("candidate target_gw differs")
+    if int(manifest.get("configured_max_transfers") or -1) != int(max_transfers):
+        reasons.append("configured max_transfers differs")
+
+    recorded_top_n = manifest.get("configured_candidate_top_n")
+    if recorded_top_n is None:
+        reasons.append("candidate predates Day129B top-N fingerprinting")
+    elif int(recorded_top_n) != int(candidate_top_n):
+        reasons.append("configured candidate top_n differs")
+
+    inputs = manifest.get("inputs")
+    input_fingerprints = manifest.get("input_fingerprints")
+    if not isinstance(inputs, Mapping) or not isinstance(input_fingerprints, Mapping):
+        reasons.append("candidate input fingerprint contract is missing")
+    else:
+        for key in ("prediction_manifest", "previous_frozen_model_team"):
+            raw = inputs.get(key)
+            expected = input_fingerprints.get(key)
+            if not raw or not expected:
+                reasons.append("%s fingerprint is missing" % key)
+                continue
+            path = Path(str(raw))
+            if not path.is_file():
+                reasons.append("%s source file is missing" % key)
+                continue
+            if sha256_file(path) != str(expected):
+                reasons.append("%s source fingerprint changed" % key)
+
+        prediction_run_raw = inputs.get("prediction_run")
+        latest_prediction = discover_prediction_run(
+            planning_root, season, target_gw
+        )
+        if not prediction_run_raw or latest_prediction is None:
+            reasons.append("current prediction run cannot be resolved")
+        elif latest_prediction.resolve() != Path(str(prediction_run_raw)).resolve():
+            reasons.append("a different/newer prediction run is now current")
+
+        try:
+            _, current_previous_path, _ = discover_previous_model_team_state(
+                planning_root,
+                season=season,
+                target_gw=target_gw,
+            )
+        except Exception as exc:
+            reasons.append("current predecessor state cannot be resolved: %s" % exc)
+        else:
+            recorded_previous = inputs.get("previous_frozen_model_team")
+            if not recorded_previous:
+                reasons.append("candidate predecessor path is missing")
+            elif current_previous_path.resolve() != Path(str(recorded_previous)).resolve():
+                reasons.append("current predecessor frozen state differs")
+
+    fingerprint = candidate_resume_fingerprint(package)
+    return {
+        "compatible": len(reasons) == 0,
+        "fingerprint": fingerprint,
+        "reasons": reasons,
+    }
+
+
+def _record_pre_candidate_reuse(
+    recorder: StageRecorder,
+    package_dir: Path,
+    fingerprint: str,
+) -> None:
+    reason = "Fingerprint-compatible completed PRE candidate already exists."
+    skipped = (
+        "live_ingest",
+        "prediction_mode",
+        "player_model",
+        "match_model",
+        "prediction_horizon",
+        "owned_squad_state",
+        "free_transfer_ledger",
+        "transfer_candidates",
+        "transfer_decision",
+        "lineup_selection",
+    )
+    for name in skipped:
+        started = time.time()
+        recorder.add(
+            name,
+            "SKIPPED",
+            started,
+            fingerprint=fingerprint,
+            skip_reason=reason,
+            note="--resume preserved the completed candidate rather than rerunning upstream work.",
+        )
+    started = time.time()
+    recorder.add(
+        "pre_deadline_candidate",
+        "REUSED",
+        started,
+        outputs=[str(package_dir)],
+        fingerprint=fingerprint,
+        note=reason,
+    )
+
+
+def inspect_auto_state(
+    planning_root: Path,
+    *,
+    season: str,
+    target_gw: int,
+) -> Dict[str, Any]:
+    previous_gw = int(target_gw) - 1
+    previous_evaluation = (
+        discover_final_evaluation(planning_root, season, previous_gw)
+        if previous_gw >= 1
+        else None
+    )
+    previous_actuals = (
+        discover_final_actual_manifest(planning_root, season, previous_gw)
+        if previous_gw >= 1
+        else None
+    )
+    target_candidate = find_reusable_candidate_package(
+        planning_root, season, target_gw
+    )
+    target_final_freeze = discover_final_freeze(
+        planning_root, season, target_gw
+    )
+    latest_prediction = discover_prediction_run(
+        planning_root, season, target_gw
+    )
+
+    if target_final_freeze is not None:
+        action = "POST_CATCHUP_IF_NEEDED_THEN_NOOP"
+    elif previous_gw >= 1 and previous_evaluation is None:
+        action = "POST_THEN_PRE"
+    elif target_candidate is not None:
+        action = "PRE_OR_RESUME_CANDIDATE"
+    else:
+        action = "PRE"
+
+    return {
+        "state_version": "fpl_auto_state_v1",
+        "season": str(season),
+        "target_gw": int(target_gw),
+        "previous_gw": previous_gw if previous_gw >= 1 else None,
+        "previous_final_evaluation": (
+            str(previous_evaluation) if previous_evaluation is not None else None
+        ),
+        "previous_final_actuals": (
+            str(previous_actuals) if previous_actuals is not None else None
+        ),
+        "target_candidate": (
+            str(target_candidate) if target_candidate is not None else None
+        ),
+        "target_final_freeze": (
+            str(target_final_freeze) if target_final_freeze is not None else None
+        ),
+        "latest_prediction_run": (
+            str(latest_prediction) if latest_prediction is not None else None
+        ),
+        "resolved_action": action,
+    }
+
+
+def validate_final_freeze_candidate(
+    candidate_dir: Path,
+    *,
+    season: str,
+    target_gw: int,
+    now_utc: Optional[datetime] = None,
+) -> Dict[str, Any]:
+    """Fail closed if a candidate cannot legally become a deadline-FINAL freeze now."""
+
+    candidate = Path(candidate_dir).resolve()
+    manifest = read_json(candidate / "run_manifest.json")
+    if str(manifest.get("status") or "") != "PASS_PRE_CANDIDATE":
+        raise RuntimeError("FINAL freeze requires a PASS_PRE_CANDIDATE package.")
+    if str(manifest.get("season") or "") != str(season):
+        raise RuntimeError("Candidate season does not match FINAL freeze request.")
+    if int(manifest.get("target_gw") or -1) != int(target_gw):
+        raise RuntimeError("Candidate target_gw does not match FINAL freeze request.")
+    if manifest.get("final_deadline_freeze") is not False:
+        raise RuntimeError("Candidate package is not an unfrozen PRE candidate.")
+
+    inputs = manifest.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise RuntimeError("Candidate manifest is missing inputs.")
+    prediction_run_raw = inputs.get("prediction_run")
+    if not prediction_run_raw:
+        raise RuntimeError("Candidate manifest is missing prediction_run.")
+    prediction_run = Path(str(prediction_run_raw)).resolve()
+    prediction_manifest = read_json(prediction_run / "run_manifest.json")
+    as_of_raw = (
+        prediction_manifest.get("created_at")
+        or prediction_manifest.get("created_at_utc")
+    )
+    if not as_of_raw:
+        raise RuntimeError("Prediction manifest is missing created_at.")
+
+    bootstrap = prediction_run / "bootstrap_snapshot.json"
+    if not bootstrap.is_file():
+        outputs = prediction_manifest.get("outputs")
+        if isinstance(outputs, Mapping):
+            bootstrap = prediction_run / str(
+                outputs.get("bootstrap_snapshot") or "bootstrap_snapshot.json"
+            )
+    deadline_raw = target_gw_deadline_from_bootstrap(bootstrap, target_gw)
+
+    as_of = _parse_utc(str(as_of_raw))
+    deadline = _parse_utc(str(deadline_raw))
+    now = now_utc or datetime.now(timezone.utc)
+    if now.tzinfo is None:
+        now = now.replace(tzinfo=timezone.utc)
+    now = now.astimezone(timezone.utc)
+
+    if as_of >= deadline:
+        raise RuntimeError(
+            "Candidate source timestamp is not strictly before the FPL deadline."
+        )
+    if now >= deadline:
+        raise RuntimeError(
+            "Deadline-FINAL freeze refused because the FPL deadline has already passed."
+        )
+
+    return {
+        "candidate_dir": str(candidate),
+        "candidate_fingerprint": candidate_resume_fingerprint(candidate),
+        "as_of_utc": as_of.isoformat().replace("+00:00", "Z"),
+        "deadline_utc": deadline.isoformat().replace("+00:00", "Z"),
+        "validated_at_utc": now.isoformat().replace("+00:00", "Z"),
+    }
+
+
+def _load_previous_state_for_candidate(
+    path: Path,
+    *,
+    season: str,
+    previous_gw: int,
+) -> SquadState:
+    try:
+        return load_squad_state_json(path)
+    except Exception:
+        return canonicalize_legacy_gw2_model_team_state(
+            read_json(path),
+            expected_season=season,
+            expected_gameweek=previous_gw,
+        )
+
+
+def run_final_freeze_from_candidate(
+    *,
+    planning_root: Path,
+    season: str,
+    target_gw: int,
+    candidate_dir: Path,
+    recorder: StageRecorder,
+    resume: bool,
+) -> Path:
+    """Promote no object in place; write a new immutable Day127B FINAL snapshot."""
+
+    existing = discover_final_freeze(planning_root, season, target_gw)
+    if existing is not None:
+        started = time.time()
+        recorder.add(
+            "final_freeze_export",
+            "REUSED",
+            started,
+            outputs=[str(existing)],
+            skip_reason="A deadline-FINAL snapshot already exists.",
+            note="Immutable FINAL evidence was preserved; no duplicate freeze was created.",
+        )
+        return existing
+
+    candidate = Path(candidate_dir).resolve()
+    validation = _formal_stage(
+        recorder,
+        "freeze_window_validation",
+        dependencies=("pre_deadline_candidate",),
+        planned_inputs=("pre_deadline_candidate", "current_time", "fpl_deadline"),
+        planned_outputs=("freeze_window_authorized",),
+        function=lambda: validate_final_freeze_candidate(
+            candidate,
+            season=season,
+            target_gw=target_gw,
+        ),
+    )
+    manifest = read_json(candidate / "run_manifest.json")
+    inputs = manifest.get("inputs")
+    if not isinstance(inputs, Mapping):
+        raise RuntimeError("Candidate manifest is missing inputs.")
+
+    prediction_run = Path(str(inputs["prediction_run"])).resolve()
+    resolved_mode = str(manifest.get("resolved_prediction_mode") or "")
+    prediction_info = validate_prediction_run(
+        prediction_run,
+        season=season,
+        target_gw=target_gw,
+        resolved_mode=resolved_mode,
+    )
+
+    previous_state_path = Path(str(inputs["previous_frozen_model_team"])).resolve()
+    previous_state = _load_previous_state_for_candidate(
+        previous_state_path,
+        season=season,
+        previous_gw=int(target_gw) - 1,
+    )
+    current_owned = read_json(Path(str(inputs["current_owned_state"])).resolve())
+    decision_path = Path(str(manifest.get("transfer_decision") or (candidate / "transfer_decision.json")))
+    decision = read_json(decision_path)
+    ledger_path = candidate / "free_transfer_ledger_state.json"
+    ledger_state = read_json(ledger_path)
+
+    match_bundle = candidate / "match_model_source"
+    if not match_bundle.is_dir():
+        raise RuntimeError(
+            "Candidate package is missing match_model_source required for FINAL freeze."
+        )
+
+    as_of_time = str(validation["as_of_utc"])
+    deadline = str(validation["deadline_utc"])
+    player_spec = {
+        "run_id": prediction_run.name,
+        "artifact_kind": "target_gw_player_model",
+        "path": str(prediction_info["player_csv"]),
+        "season": season,
+        "target_gw": int(target_gw),
+        "as_of_utc": as_of_time,
+    }
+    match_spec = {
+        "run_id": prediction_run.name,
+        "artifact_kind": "target_gw_match_model_plus_scoreline",
+        "path": str(match_bundle),
+        "season": season,
+        "target_gw": int(target_gw),
+        "as_of_utc": as_of_time,
+    }
+
+    freeze_root = (
+        planning_root
+        / "frozen-snapshots"
+        / season
+        / ("gw%02d" % int(target_gw))
+        / "model-team"
+    )
+    run_id = "gw%02d_final_freeze_%s" % (int(target_gw), utc_stamp())
+    result = _formal_stage(
+        recorder,
+        "final_freeze_export",
+        dependencies=("freeze_window_validation",),
+        planned_inputs=(
+            "validated_pre_deadline_candidate",
+            "player_model_artifact",
+            "match_model_artifact",
+            "previous_frozen_model_team_state",
+            "chosen_transfer_or_no_transfer_plan",
+            "free_transfer_ledger_state",
+        ),
+        planned_outputs=("immutable_final_pre_deadline_snapshot",),
+        function=lambda: export_gameweek_pre_deadline_snapshot(
+            artifact_root=freeze_root,
+            season=season,
+            target_gw=target_gw,
+            as_of_time=as_of_time,
+            fpl_deadline_time=deadline,
+            player_model_artifact=player_spec,
+            match_model_artifact=match_spec,
+            previous_model_team_state=previous_state,
+            chosen_plan=decision,
+            transfer_ledger_state=ledger_state,
+            current_model_team_state=current_owned,
+            team_alex_reference=None,
+            final_freeze=True,
+            run_id=run_id,
+        ),
+        output_paths=lambda payload: [
+            str(payload.get("snapshot_dir")),
+            str(payload.get("manifest_path")),
+        ],
+    )
+    if result.get("final_pre_deadline_snapshot_frozen") is not True:
+        raise RuntimeError("Day127B exporter did not produce FINAL frozen evidence.")
+    return Path(str(result["snapshot_dir"]))
+
+
+def _path_run_id(path: Optional[Path]) -> Optional[str]:
+    return None if path is None else Path(path).name
+
+
+def print_concise_refresh_summary(result: Mapping[str, Any]) -> None:
+    print("=== FPL Unified Refresh ===")
+    print("status:", result.get("status"))
+    print("phase:", result.get("phase"))
+    print("action:", result.get("action"))
+    print("candidate_run_id:", result.get("candidate_run_id"))
+    print("active_run_id:", result.get("active_run_id"))
+    print("warnings:", len(result.get("warnings") or []))
+    print("blockers:", len(result.get("blockers") or []))
+    print("manifest:", result.get("manifest_path"))
+
+
+def run_unified_refresh(
+    *,
+    args: argparse.Namespace,
+    repo_root: Path,
+    planning_root: Path,
+    python_exe: str,
+    env: Mapping[str, str],
+) -> Dict[str, Any]:
+    """Day129B operational orchestrator with durable manifest/failure recovery."""
+
+    recorder = StageRecorder()
+    initial_candidate = find_reusable_candidate_package(
+        planning_root, args.season, args.target_gw
+    )
+    initial_final = discover_final_freeze(
+        planning_root, args.season, args.target_gw
+    )
+    initial_eval = discover_final_evaluation(
+        planning_root, args.season, args.target_gw
+    )
+    auto_state = (
+        inspect_auto_state(
+            planning_root,
+            season=args.season,
+            target_gw=args.target_gw,
+        )
+        if args.phase == "auto"
+        else {}
+    )
+
+    writer = RefreshManifestWriter.create(
+        planning_root=planning_root,
+        runner_version=RUNNER_VERSION,
+        dag_version=DAG_VERSION,
+        season=args.season,
+        target_gw=args.target_gw,
+        requested_phase=args.phase,
+        resume_requested=bool(args.resume),
+        final_freeze_requested=bool(args.final_freeze),
+        discovered_state=auto_state,
+        candidate_run_id=_path_run_id(initial_candidate),
+        active_run_id=_path_run_id(initial_final or initial_eval or initial_candidate),
+    )
+
+    if args.skip_live_refresh:
+        writer.add_warning(
+            "--skip-live-refresh requested: this run intentionally reuses canonical live state."
+        )
+    if args.phase == "auto" and initial_candidate is not None and not args.resume:
+        writer.add_warning(
+            "An earlier PRE candidate exists but --resume was not requested; AUTO may create a fresh candidate."
+        )
+
+    candidate = initial_candidate
+    active: Optional[Path] = initial_final or initial_eval or initial_candidate
+    evaluation: Optional[Path] = None
+    final_freeze: Optional[Path] = initial_final
+    action = str(auto_state.get("resolved_action") or args.phase.upper())
+
+    try:
+        if args.phase == "post":
+            evaluation = run_post_pipeline(
+                repo_root=repo_root,
+                planning_root=planning_root,
+                season=args.season,
+                gw=args.target_gw,
+                python_exe=python_exe,
+                env=env,
+                recorder=recorder,
+                resume=bool(args.resume),
+                skip_live_refresh=bool(args.skip_live_refresh),
+                base_url=args.base_url,
+                api_port=args.api_port,
+            )
+            active = evaluation
+            action = "POST"
+
+        elif args.phase == "freeze":
+            if candidate is None:
+                raise RuntimeError(
+                    "No completed PRE candidate exists for explicit FINAL freeze."
+                )
+            final_freeze = run_final_freeze_from_candidate(
+                planning_root=planning_root,
+                season=args.season,
+                target_gw=args.target_gw,
+                candidate_dir=candidate,
+                recorder=recorder,
+                resume=bool(args.resume),
+            )
+            active = final_freeze
+            action = "FINAL_FREEZE"
+
+        elif args.phase == "pre":
+            candidate = run_pre(
+                args=args,
+                repo_root=repo_root,
+                planning_root=planning_root,
+                python_exe=python_exe,
+                env=env,
+                recorder=recorder,
+            )
+            active = candidate
+            action = "PRE"
+
+        elif args.phase == "auto":
+            previous_gw = int(args.target_gw) - 1
+            previous_eval = (
+                discover_final_evaluation(
+                    planning_root, args.season, previous_gw
+                )
+                if previous_gw >= 1
+                else None
+            )
+            if previous_gw >= 1 and previous_eval is None:
+                previous_eval = run_post_pipeline(
+                    repo_root=repo_root,
+                    planning_root=planning_root,
+                    season=args.season,
+                    gw=previous_gw,
+                    python_exe=python_exe,
+                    env=env,
+                    recorder=recorder,
+                    resume=bool(args.resume),
+                    skip_live_refresh=bool(args.skip_live_refresh),
+                    base_url=args.base_url,
+                    api_port=args.api_port,
+                )
+                recorder.add(
+                    "previous_gw_post",
+                    "PASS",
+                    time.time(),
+                    outputs=[str(previous_eval)],
+                    note="AUTO completed missing previous-GW POST before PRE.",
+                )
+            elif previous_gw >= 1:
+                recorder.add(
+                    "previous_gw_post",
+                    "SKIPPED",
+                    time.time(),
+                    outputs=[str(previous_eval)],
+                    skip_reason="Previous-GW FINAL evaluation already exists.",
+                    note="AUTO preserved existing immutable POST evidence.",
+                )
+
+            final_freeze = discover_final_freeze(
+                planning_root, args.season, args.target_gw
+            )
+            if final_freeze is not None:
+                recorder.add(
+                    "pre_deadline_candidate",
+                    "SKIPPED",
+                    time.time(),
+                    outputs=[str(final_freeze)],
+                    skip_reason="Target GW already has immutable deadline-FINAL evidence.",
+                )
+                active = final_freeze
+                action = "NOOP_TARGET_ALREADY_FINAL"
+            else:
+                candidate = run_pre(
+                    args=args,
+                    repo_root=repo_root,
+                    planning_root=planning_root,
+                    python_exe=python_exe,
+                    env=env,
+                    recorder=recorder,
+                )
+                active = candidate
+                action = "PRE"
+                if args.final_freeze:
+                    final_freeze = run_final_freeze_from_candidate(
+                        planning_root=planning_root,
+                        season=args.season,
+                        target_gw=args.target_gw,
+                        candidate_dir=candidate,
+                        recorder=recorder,
+                        resume=bool(args.resume),
+                    )
+                    active = final_freeze
+                    action = "PRE_THEN_FINAL_FREEZE"
+        else:
+            raise RuntimeError("Unsupported executable phase: %s" % args.phase)
+
+        writer.update(
+            status="PASS",
+            resolved_action=action,
+            stage_results=recorder.rows,
+            stage_summary=manifest_stage_summary(recorder.rows),
+            candidate_run_id=_path_run_id(candidate),
+            active_run_id=_path_run_id(active),
+            outputs={
+                "candidate": str(candidate) if candidate is not None else None,
+                "evaluation": str(evaluation) if evaluation is not None else None,
+                "final_freeze": str(final_freeze) if final_freeze is not None else None,
+                "active": str(active) if active is not None else None,
+            },
+        )
+        return {
+            "status": "PASS",
+            "phase": args.phase,
+            "action": action,
+            "candidate_run_id": _path_run_id(candidate),
+            "active_run_id": _path_run_id(active),
+            "candidate": candidate,
+            "active": active,
+            "warnings": list(writer.payload.get("warnings") or []),
+            "blockers": list(writer.payload.get("blockers") or []),
+            "manifest_path": str(writer.path),
+        }
+    except Exception as exc:
+        # Never delete/repoint an earlier successful candidate/active artifact.
+        preserved_candidate = candidate or initial_candidate
+        preserved_active = active or initial_final or initial_eval or initial_candidate
+        writer.add_blocker(str(exc))
+        writer.update(
+            status="FAILED",
+            resolved_action=action,
+            stage_results=recorder.rows,
+            stage_summary=manifest_stage_summary(recorder.rows),
+            candidate_run_id=_path_run_id(preserved_candidate),
+            active_run_id=_path_run_id(preserved_active),
+            outputs={
+                "candidate": (
+                    str(preserved_candidate)
+                    if preserved_candidate is not None
+                    else None
+                ),
+                "active": (
+                    str(preserved_active)
+                    if preserved_active is not None
+                    else None
+                ),
+            },
+            failure={
+                "type": exc.__class__.__name__,
+                "message": str(exc),
+                "last_successful_stage": next(
+                    (
+                        row["stage"]
+                        for row in reversed(recorder.rows)
+                        if row.get("status") in ("PASS", "REUSED")
+                    ),
+                    None,
+                ),
+            },
+        )
+        raise
 
 def write_candidate_package(
     out_dir: Path,
@@ -2960,6 +3746,36 @@ def run_pre(
     if not prior_season:
         year = int(args.season.split("_")[0])
         prior_season = "%s_%02d" % (year - 1, year % 100)
+
+    if args.resume:
+        reusable = find_reusable_candidate_package(
+            planning_root, args.season, args.target_gw
+        )
+        if reusable is not None:
+            compatibility = candidate_resume_compatibility(
+                reusable,
+                planning_root=planning_root,
+                season=args.season,
+                target_gw=args.target_gw,
+                max_transfers=args.max_transfers,
+                candidate_top_n=args.top_n,
+            )
+            if compatibility["compatible"]:
+                _record_pre_candidate_reuse(
+                    recorder,
+                    reusable,
+                    str(compatibility["fingerprint"]),
+                )
+                return reusable
+            started = time.time()
+            recorder.add(
+                "resume_candidate_check",
+                "SKIPPED",
+                started,
+                fingerprint=str(compatibility.get("fingerprint") or ""),
+                skip_reason="; ".join(compatibility["reasons"]),
+                note="Existing candidate was not fingerprint-compatible; PRE will rerun.",
+            )
 
     api_proc: Optional[subprocess.Popen] = None
     try:
@@ -3357,6 +4173,7 @@ def run_pre(
             recorder=recorder,
             publish_requested=args.publish_predictions,
             max_transfers=args.max_transfers,
+            candidate_top_n=args.top_n,
         )
 
         # Small human-readable pointer without duplicating decision/model logic.
@@ -3383,12 +4200,13 @@ def run_pre(
             encoding="utf-8",
         )
 
-        print("\n=== FPL Unified PRE Complete ===")
-        print("candidate_package:", package_dir)
-        print("manifest:", manifest_path)
-        print("decision:", decision_path)
-        print("snapshot:", snapshot_result["snapshot_dir"])
-        print("final_deadline_freeze: False")
+        if CLI_VERBOSE:
+            print("\n=== FPL Unified PRE Complete ===")
+            print("candidate_package:", package_dir)
+            print("manifest:", manifest_path)
+            print("decision:", decision_path)
+            print("snapshot:", snapshot_result["snapshot_dir"])
+            print("final_deadline_freeze: False")
         return package_dir
     finally:
         if api_proc is not None:
@@ -3400,8 +4218,12 @@ def run_pre(
 
 
 
+
 def main() -> None:
+    global CLI_VERBOSE
+
     args = parse_args()
+    CLI_VERBOSE = bool(args.verbose)
     repo_root = detect_repo_root(args.repo_root)
     planning_root = detect_planning_root(repo_root, args.planning_root)
     backend_dir = repo_root / "backend"
@@ -3410,8 +4232,6 @@ def main() -> None:
         raise RuntimeError("Backend virtualenv Python not found: %s" % python_exe)
 
     env = child_env(repo_root, args.season)
-    recorder = StageRecorder()
-
     validate_phase_request(args.phase, final_freeze=bool(args.final_freeze))
 
     if args.dry_run:
@@ -3431,61 +4251,14 @@ def main() -> None:
         print_status(planning_root, args.season, args.target_gw)
         return
 
-    if args.phase == "freeze":
-        raise RuntimeError(
-            "Day128A defines and validates the FINAL-freeze DAG adapter but does not "
-            "wire live freeze execution yet. The explicit Day127B exporter remains the "
-            "formal freeze producer until a later runner-integration milestone."
-        )
-
-    if args.phase == "auto" and args.final_freeze:
-        raise RuntimeError(
-            "Day128A can plan --phase auto --final-freeze with --dry-run, but live "
-            "FINAL-freeze execution is intentionally fail-closed until runner integration."
-        )
-
-    if args.phase == "post":
-        result = run_post_pipeline(
-            repo_root=repo_root,
-            planning_root=planning_root,
-            season=args.season,
-            gw=args.target_gw,
-            python_exe=python_exe,
-            env=env,
-            recorder=recorder,
-            resume=args.resume,
-            skip_live_refresh=bool(args.skip_live_refresh),
-            base_url=args.base_url,
-            api_port=args.api_port,
-        )
-        print("\n=== FPL Unified POST Complete ===")
-        print("post_integration_version:", POST_INTEGRATION_VERSION)
-        print("evaluation_dir:", result)
-        return
-
-    if args.phase == "auto" and args.target_gw > 1:
-        # Preserve Day128B AUTO catch-up semantics. Day129B owns broader automatic
-        # state detection/resume behavior; Day129A only wires explicit --phase post.
-        run_post_evaluation(
-            repo_root=repo_root,
-            planning_root=planning_root,
-            season=args.season,
-            gw=args.target_gw - 1,
-            python_exe=python_exe,
-            env=env,
-            recorder=recorder,
-            resume=args.resume,
-            dry_run=False,
-        )
-
-    run_pre(
+    result = run_unified_refresh(
         args=args,
         repo_root=repo_root,
         planning_root=planning_root,
         python_exe=python_exe,
         env=env,
-        recorder=recorder,
     )
+    print_concise_refresh_summary(result)
 
 
 if __name__ == "__main__":
