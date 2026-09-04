@@ -625,6 +625,14 @@ def parse_args() -> argparse.Namespace:
     )
     p.add_argument("--position-top-n", type=int, default=10)
     p.add_argument(
+        "--team-alex-reference-json",
+        default=None,
+        help=(
+            "Optional immutable Team Alex pre-deadline reference JSON. "
+            "When provided, PRE/FREEZE preserves it as the independent Team Alex track."
+        ),
+    )
+    p.add_argument(
         "--verbose",
         action="store_true",
         help="Print child-command/stdout detail. Default weekly output is concise.",
@@ -2959,6 +2967,25 @@ def _load_previous_state_for_candidate(
         )
 
 
+
+def _final_freeze_has_scoreable_team_alex(final_dir: Path) -> bool:
+    """Return True only when FINAL contains a copied, scoreable Team Alex source."""
+
+    root = Path(final_dir)
+    reference_path = root / "tracks" / "team_alex" / "reference.json"
+    if not reference_path.is_file():
+        return False
+    try:
+        payload = read_json(reference_path)
+    except Exception:
+        return False
+    if not isinstance(payload, Mapping) or payload.get("provided") is not True:
+        return False
+    rel = str(payload.get("snapshot_copy_path") or "").strip()
+    if not rel:
+        return False
+    return (root / rel).exists()
+
 def run_final_freeze_from_candidate(
     *,
     planning_root: Path,
@@ -2967,21 +2994,35 @@ def run_final_freeze_from_candidate(
     candidate_dir: Path,
     recorder: StageRecorder,
     resume: bool,
+    team_alex_reference_json: Optional[str] = None,
 ) -> Path:
     """Promote no object in place; write a new immutable Day127B FINAL snapshot."""
 
+    requested_team_alex = bool(str(team_alex_reference_json or "").strip())
     existing = discover_final_freeze(planning_root, season, target_gw)
-    if existing is not None:
+    if existing is not None and (
+        not requested_team_alex or _final_freeze_has_scoreable_team_alex(existing)
+    ):
         started = time.time()
         recorder.add(
             "final_freeze_export",
             "REUSED",
             started,
             outputs=[str(existing)],
-            skip_reason="A deadline-FINAL snapshot already exists.",
+            skip_reason="A complete deadline-FINAL snapshot already exists.",
             note="Immutable FINAL evidence was preserved; no duplicate freeze was created.",
         )
         return existing
+
+    team_alex_reference: Optional[Mapping[str, Any]] = None
+    if requested_team_alex:
+        team_alex_path = Path(str(team_alex_reference_json)).expanduser().resolve()
+        if not team_alex_path.is_file():
+            raise RuntimeError("Team Alex reference JSON does not exist: %s" % team_alex_path)
+        loaded_team_alex = read_json(team_alex_path)
+        if not isinstance(loaded_team_alex, Mapping):
+            raise RuntimeError("Team Alex reference JSON root must be an object: %s" % team_alex_path)
+        team_alex_reference = dict(loaded_team_alex)
 
     candidate = Path(candidate_dir).resolve()
     validation = _formal_stage(
@@ -3028,15 +3069,41 @@ def run_final_freeze_from_candidate(
             "Candidate package is missing match_model_source required for FINAL freeze."
         )
 
-    as_of_time = str(validation["as_of_utc"])
+    source_as_of_time = str(validation["as_of_utc"])
+    snapshot_as_of_time = source_as_of_time
     deadline = str(validation["deadline_utc"])
+
+    # FINAL may combine an earlier frozen model candidate with a later,
+    # independently executed Team Alex state. The FINAL snapshot as-of must
+    # therefore be at least as late as every included track, while the
+    # Player/Match source artifacts retain their original candidate as-of.
+    if team_alex_reference is not None and team_alex_reference.get("as_of_utc"):
+        from datetime import datetime, timezone
+
+        def _as_utc(value: str) -> datetime:
+            parsed = datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+            if parsed.tzinfo is None:
+                parsed = parsed.replace(tzinfo=timezone.utc)
+            return parsed.astimezone(timezone.utc)
+
+        source_dt = _as_utc(source_as_of_time)
+        alex_dt = _as_utc(str(team_alex_reference["as_of_utc"]))
+        deadline_dt = _as_utc(deadline)
+
+        if alex_dt >= deadline_dt:
+            raise RuntimeError(
+                "Team Alex reference is not pre-deadline and cannot enter FINAL."
+            )
+        if alex_dt > source_dt:
+            snapshot_as_of_time = alex_dt.isoformat().replace("+00:00", "Z")
+
     player_spec = {
         "run_id": prediction_run.name,
         "artifact_kind": "target_gw_player_model",
         "path": str(prediction_info["player_csv"]),
         "season": season,
         "target_gw": int(target_gw),
-        "as_of_utc": as_of_time,
+        "as_of_utc": source_as_of_time,
     }
     match_spec = {
         "run_id": prediction_run.name,
@@ -3044,7 +3111,7 @@ def run_final_freeze_from_candidate(
         "path": str(match_bundle),
         "season": season,
         "target_gw": int(target_gw),
-        "as_of_utc": as_of_time,
+        "as_of_utc": source_as_of_time,
     }
 
     freeze_root = (
@@ -3066,13 +3133,14 @@ def run_final_freeze_from_candidate(
             "previous_frozen_model_team_state",
             "chosen_transfer_or_no_transfer_plan",
             "free_transfer_ledger_state",
+            "team_alex_reference",
         ),
         planned_outputs=("immutable_final_pre_deadline_snapshot",),
         function=lambda: export_gameweek_pre_deadline_snapshot(
             artifact_root=freeze_root,
             season=season,
             target_gw=target_gw,
-            as_of_time=as_of_time,
+            as_of_time=snapshot_as_of_time,
             fpl_deadline_time=deadline,
             player_model_artifact=player_spec,
             match_model_artifact=match_spec,
@@ -3080,7 +3148,7 @@ def run_final_freeze_from_candidate(
             chosen_plan=decision,
             transfer_ledger_state=ledger_state,
             current_model_team_state=current_owned,
-            team_alex_reference=None,
+            team_alex_reference=team_alex_reference,
             final_freeze=True,
             run_id=run_id,
         ),
@@ -3199,6 +3267,7 @@ def run_unified_refresh(
                 candidate_dir=candidate,
                 recorder=recorder,
                 resume=bool(args.resume),
+                team_alex_reference_json=getattr(args, "team_alex_reference_json", None),
             )
             active = final_freeze
             action = "FINAL_FREEZE"
@@ -3258,7 +3327,13 @@ def run_unified_refresh(
             final_freeze = discover_final_freeze(
                 planning_root, args.season, args.target_gw
             )
-            if final_freeze is not None:
+            team_alex_repair_requested = bool(
+                final_freeze is not None
+                and args.final_freeze
+                and getattr(args, "team_alex_reference_json", None)
+                and not _final_freeze_has_scoreable_team_alex(final_freeze)
+            )
+            if final_freeze is not None and not team_alex_repair_requested:
                 recorder.add(
                     "pre_deadline_candidate",
                     "SKIPPED",
@@ -3268,6 +3343,22 @@ def run_unified_refresh(
                 )
                 active = final_freeze
                 action = "NOOP_TARGET_ALREADY_FINAL"
+            elif team_alex_repair_requested:
+                if candidate is None:
+                    raise RuntimeError(
+                        "No completed PRE candidate exists to append a complete Team Alex FINAL freeze."
+                    )
+                final_freeze = run_final_freeze_from_candidate(
+                    planning_root=planning_root,
+                    season=args.season,
+                    target_gw=args.target_gw,
+                    candidate_dir=candidate,
+                    recorder=recorder,
+                    resume=bool(args.resume),
+                    team_alex_reference_json=getattr(args, "team_alex_reference_json", None),
+                )
+                active = final_freeze
+                action = "FINAL_FREEZE_SUPERSEDE_INCOMPLETE"
             else:
                 candidate = run_pre(
                     args=args,
@@ -3287,6 +3378,7 @@ def run_unified_refresh(
                         candidate_dir=candidate,
                         recorder=recorder,
                         resume=bool(args.resume),
+                        team_alex_reference_json=getattr(args, "team_alex_reference_json", None),
                     )
                     active = final_freeze
                     action = "PRE_THEN_FINAL_FREEZE"
@@ -4139,7 +4231,11 @@ def run_pre(
                 chosen_plan=decision,
                 transfer_ledger_state=ledger_state,
                 current_model_team_state=current_owned,
-                team_alex_reference=None,
+                team_alex_reference=(
+                    read_json(Path(args.team_alex_reference_json).expanduser().resolve())
+                    if getattr(args, "team_alex_reference_json", None)
+                    else None
+                ),
                 final_freeze=False,
                 run_id=package_dir.name + "_snapshot",
             ),
